@@ -4,6 +4,7 @@ run_libero_eval.py
 Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 """
 
+
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ import numpy as np
 import tqdm
 from libero.libero import benchmark
 
-import wandb
+import wandb  # TODO: 改成 swanlab
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
@@ -86,9 +87,11 @@ class GenerateConfig:
     # Model-specific parameters
     #################################################################################################################
     model_family: str = "openvla"                    # Model family
-    pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
+    pretrained_checkpoint: Union[str, Path] = "moojink/openvla-7b-oft-finetuned-libero-spatial"     # Pretrained checkpoint path
 
     use_l1_regression: bool = True                   # If True, uses continuous action head with L1 regression objective
+    use_vae: bool = False                            # If True, uses VAE action head
+    vae_latent_dim: int = 64                         # 可选，VAE 潜在空间维度
     use_diffusion: bool = False                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for inference
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
@@ -156,7 +159,7 @@ def initialize_model(cfg: GenerateConfig):
 
     # Load action head if needed
     action_head = None
-    if cfg.use_l1_regression or cfg.use_diffusion:
+    if cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion:
         action_head = get_action_head(cfg, model.llm_dim)
 
     # Load noisy action projector if using diffusion
@@ -372,7 +375,7 @@ def run_task(
 ):
     """Run evaluation for a single task."""
     # Get task
-    task = task_suite.get_task(task_id)
+    task = task_suite.get_task(task_id)  # 
 
     # Get initial states
     initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)

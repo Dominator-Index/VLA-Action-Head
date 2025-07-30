@@ -24,7 +24,7 @@ json_numpy.patch()
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
@@ -241,8 +241,8 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
 
     # If the component was trained with DDP, elements in the state dict have prefix "module." which we must remove
     new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("module."):
+    for k, v in state_dict.items():   
+        if k.startswith("module."):   # 去掉分布式训练 DDP.module 的前缀
             new_state_dict[k[7:]] = v
         else:
             new_state_dict[k] = v
@@ -469,16 +469,21 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         llm_dim: Dimension of the language model
 
     Returns:
-        Union[L1RegressionActionHead, DiffusionActionHead]: The initialized action head
+        Union[L1RegressionActionHead, DiffusionActionHead, VAEActionHead]: The initialized action head
 
     Raises:
         AssertionError: If both L1 regression and diffusion are specified
     """
-    assert not (cfg.use_l1_regression and cfg.use_diffusion), "Cannot use both L1 regression and diffusion action head!"
+    assert not (cfg.use_l1_regression and cfg.use_diffusion and cfg.use_vae), "Cannot use L1 regression, diffusion action and VAE head!"
 
     # Initialize appropriate action head based on configuration
     if cfg.use_l1_regression:
         action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
+    elif cfg.use_vae:
+        action_head = VAEActionHead(
+            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, latent_dim=getattr(cfg, "vae_latent_dim", 32)
+        )
+            
     elif cfg.use_diffusion:
         action_head = DiffusionActionHead(
             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps=cfg.num_diffusion_steps

@@ -80,6 +80,7 @@ class MLPResNet(nn.Module):
         x = self.fc2(x)  # shape: (batch_size, output_dim)
         return x
 
+# TODO: Add action heads
 
 class L1RegressionActionHead(nn.Module):
     """Simple MLP-based action head that generates continuous actions via L1 regression."""
@@ -106,7 +107,99 @@ class L1RegressionActionHead(nn.Module):
         action = self.model(rearranged_actions_hidden_states)
         return action
 
+class VAEActionHead(nn.Module):
+    """
+    Variational Autoencoder (VAE)-based action head for continuous action prediction.
+    编码 action hidden states 到潜在空间，采样后解码生成动作。
+    """
+    
+    def __init__(
+        self, input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+        latent_dim=32,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.latent_dim = latent_dim
+        
+        # 编码器：输入为 (batch, chunk_len * action_dim, input_dim)，flatten后为 (batch, chunk_len * action_dim * input_dim)
+        self.encoder = MLPResNet(
+            num_blocks=2,
+            input_dim=input_dim * NUM_ACTIONS_CHUNK * action_dim // ACTION_DIM,  # input_dim * chunk_len
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+        )
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
+        # 解码器：输入 latent，输出 (batch, chunk_len * action_dim)
+        self.decoder = MLPResNet(
+            num_blocks=2,
+            input_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            output_dim=NUM_ACTIONS_CHUNK * action_dim,
+        )
+    
+    def encode(self, actions_hidden_states):
+        # actions_hidden_states: (batch, chunk_len * action_dim, input_dim)
+        batch_size = actions_hidden_states.shape[0]
+        x = actions_hidden_states.reshape(batch_size, -1)  # Flatten to (batch_size, chunk_len * action_dim * input_dim)
+        h = self.encoder(x)  # (batch_size, hidden_dim)
+        mu = self.fc_mu(h)  # (batch_size, latent_dim)
+        logvar = self.fc_logvar(h)  # (batch_size, latent_dim)
+        return mu, logvar
+    
+    def reparameterize(self, mu, logvar):
+        # 采样 latent 向量
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std, device=std.device)
+        return mu + eps * std
+    
+    def decode(self, z):
+        # z: (batch, latent_dim)
+        recon = self.decoder(z)  # (batch_size, chunk_len * action_dim)
+        recon = recon.view(-1, NUM_ACTIONS_CHUNK, self.action_dim)  # (batch, chunk_len, action_dim)
+        return recon
+
+    def forward(self, actions_hidden_states):
+        """
+        前向传播，返回重构的 action、均值、对数方差
+        actions_hidden_states: (batch, chunk_len * action_dim, input_dim)
+        """
+        mu, logvar = self.encode(actions_hidden_states)  # (batch, latent_dim)
+        z = self.reparameterize(mu, logvar)  # (batch, latent_dim)
+        recon_actions = self.decode(z)  # (batch, chunk_len, action_dim)
+        return recon_actions, mu, logvar
+    
+    def get_vae_loss(self, actions_hidden_states, ground_truth_actions, batch_size=None, device_id=None, beta=1.0):
+        """
+        计算 VAE 损失（重构损失 + KL 散度）
+        actions_hidden_states: (batch, act_chunk_len, hidden_dim)
+        ground_truth_actions: (batch, act_chunk_len, action_dim)
+        """
+        recon_actions, mu, logvar = self.forward(actions_hidden_states)  # (batch, act_chunk_len, action_dim), (batch, latent_dim), (batch, latent_dim)
+        # 重构损失（L2）
+        recon_loss = torch.nn.functional.mse_loss(recon_actions, ground_truth_actions, reduction='mean')  # (batch, act_chunk_len, action_dim)
+        # KL 散度
+        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())  # (batch, latent_dim)
+        # 总损失
+        loss = recon_loss + beta * kl_loss  # beta 是 KL 散度的权重
+        return loss
+    
+    def predict_action(self, actions_hidden_states):
+        """
+        推理时只用均值，不加噪声
+        actions_hidden_states: (batch, chunk_len * action_dim, input_dim)
+        返回: (batch, chunk_len, action_dim)
+        """
+        mu, _ = self.encode(actions_hidden_states)
+        recon_action = self.decode(mu)
+        return recon_action
+        
+    
+
+    
 class NoisePredictionModel(nn.Module):
     """
     Diffusion noise prediction model that takes an observation embedding (which fuses the

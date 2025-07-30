@@ -31,7 +31,7 @@ OPENVLA_V01_SYSTEM_PROMPT = (
 # Model image size configuration
 MODEL_IMAGE_SIZES = {
     "openvla": 224,
-    # Add other models as needed
+    # TODO: Add other models as needed
 }
 
 

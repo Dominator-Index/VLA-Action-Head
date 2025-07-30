@@ -1041,17 +1041,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PROMPT_TOKENS,
                 noisy_action_projector,
             )
-        elif use_vae:
-            normalized_actions, actions_hidden_states = self._run_vae_prediction(
-                input_embeddings,
-                all_actions_mask,
-                projected_patch_embeddings,
-                attention_mask,
-                labels,
-                NUM_PATCHES,
-                NUM_PROMPT_TOKENS,
-                action_head,
-            )
         else:
             # Run regression or discrete token-based prediction
             normalized_actions, actions_hidden_states = self._regression_or_discrete_prediction(
@@ -1069,73 +1058,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
 
         return actions, actions_hidden_states
-    
-    def _run_vae_prediction(
-        self,
-        input_embeddings,
-        all_actions_mask,
-        projected_patch_embeddings,
-        attention_mask,
-        labels,
-        NUM_PATCHES,
-        NUM_PROMPT_TOKENS,
-        action_head,
-        ):
-        """
-        Run VAE-based action prediction.
 
-        Args:
-            input_embeddings: Embeddings from the language model embedding layer (B, seq_len, D)
-            all_actions_mask: Boolean mask for action tokens (B, seq_len)
-            projected_patch_embeddings: Visual (和proprio等)特征经过projector后的输出 (B, num_patches, D)
-            attention_mask: Attention mask (B, seq_len)
-            labels: 标签 (B, seq_len)，用于 action mask 计算
-            NUM_PATCHES: 视觉patch数（包含proprio/diffusion token等）
-            NUM_PROMPT_TOKENS: prompt token 数（不包括action token和stop token）
-            action_head: VAE action head，需实现 encode 和 decode 方法
-
-        Returns:
-            vae_actions: 预测的动作 (NUM_ACTIONS_CHUNK, ACTION_DIM)
-            actions_hidden_states: 动作token的hidden state (B, act_chunk_len, D)
-        """
-        # 1. Zero out action token embeddings
-        all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
-        input_embeddings = input_embeddings * ~all_actions_mask
-
-        # 2. Build multimodal embeddings & attention mask
-        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-            input_embeddings, projected_patch_embeddings, attention_mask
-        )  
-        
-        # 3. Forward pass through language model，获取hidden states
-        language_model_output = self.language_model(
-            input_ids=None,
-            attention_mask=multimodal_attention_mask,
-            position_ids=None,
-            past_key_values=None,
-            inputs_embeds=multimodal_embeddings,
-            labels=None,
-            use_cache=None,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )      
-        
-        # 4. 提取动作token的hidden state
-        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-        actions_hidden_states = last_hidden_states[
-            :,
-            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-            :,
-        ]  # (B, act_chunk_len, D)
-        
-        # 5. VAE生成动作
-        vae_actions = action_head.predict_action(actions_hidden_states)  # (B, act_chunk_len, action_dim)
-        vae_actions = vae_actions[0] if vae_actions.shape[0] == 1 else vae_actions  # (act_chunk_len, action_dim)
-        vae_actions = vae_actions.float().cpu().detach().numpy()
-        
-        return vae_actions, actions_hidden_states
-        
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
         """Validate and resolve the unnormalization key for action statistics"""
