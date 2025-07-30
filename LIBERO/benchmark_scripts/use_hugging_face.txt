@@ -1,0 +1,7 @@
+python benchmark_scripts/download_libero_datasets.py --use-huggingface
+
+
+python benchmark_scripts/download_libero_datasets.py \
+  --download-dir /home/ouyangzl/openvla-oft/LIBERO/libero/datasets/rlds \
+  --datasets libero_spatial_no_noops \
+  --use-huggingface
