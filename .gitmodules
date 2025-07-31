@@ -1,3 +1,9 @@
 [submodule "VLA-OS"]
 	path = VLA-OS
 	url = git@github.com:Dominator-Index/VLA-OS.git
+[submodule "COT-FM"]
+	path = COT-FM
+	url = git@github.com:Dominator-Index/cot_fm.git
+[submodule "CFM"]
+	path = CFM
+	url = git@github.com:Dominator-Index/conditional-flow-matching.git
