@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
+from transformers import LlamaForCausalLM, LlamaConfig
 
 # Add conditional flow matching 
 from torchcfm.conditional_flow_matching import *
@@ -454,7 +455,157 @@ class COTFlowMatchingActionHead(OTFlowMatchingActionHead):
         loss = torch.nn.functional.mse_loss(flow_pred, u_t)
         return loss
 
-
+class EndToEndDiffusionActionHead(nn.Module):
+    """端到端扩散模型作为动作头，将RobotTransformerNet的核心功能集成到模块化框架中。"""
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+        num_diffusion_steps=50,
+        prediction_type='epsilon',
+        num_layers=8,
+        dropout_rate=0.1,
+        intermediate_size=2048,
+        attn_implementation='eager'
+    ):
+        super().__init__()
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.action_dim = action_dim
+        self.num_diffusion_steps = num_diffusion_steps
+        
+        # 时间编码器 - 使用已有的SinusoidalPositionalEncoding而不是SinusoidalPosEmb
+        self.time_encoder = SinusoidalPositionalEncoding(hidden_dim)
+        
+        # 扩散噪声预测器 - 使用RobotTransformerNet中的transformer部分
+        self.transformer = LlamaForCausalLM(
+            LlamaConfig(
+                vocab_size=hidden_dim,  # 这里不需要词表，只需保持维度一致
+                hidden_size=hidden_dim,
+                intermediate_size=intermediate_size,
+                num_hidden_layers=num_layers,
+                num_attention_heads=hidden_dim // 64,
+                attention_dropout=dropout_rate,
+                _flash_attn_2_enabled=True if attn_implementation != 'eager' else False
+            )
+        )
+        
+        # 从DenoisingMLP的功能重新实现或简化版本
+        self.denoising_mlp = MLPResNet(
+            num_blocks=3, 
+            input_dim=hidden_dim + action_dim,  # 输入包含hidden_state和noisy_action
+            hidden_dim=hidden_dim,
+            output_dim=action_dim
+        )
+        
+        # 使用与RobotTransformerNet相同的噪声调度器
+        from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+        from diffusers import DDIMScheduler
+        
+        self.noise_scheduler = DDPMScheduler(
+            beta_schedule='squaredcos_cap_v2',
+            num_train_timesteps=100,
+            prediction_type=prediction_type,
+        )
+        
+        self.noise_scheduler_eval = DDIMScheduler(
+            beta_schedule='squaredcos_cap_v2',
+            num_train_timesteps=100,
+            prediction_type=prediction_type,
+        )
+    
+    def sample_noisy_actions(self, ground_truth_actions):
+        """采样噪声化的动作用于训练"""
+        batch_size = ground_truth_actions.shape[0]
+        device = ground_truth_actions.device
+        
+        # 随机采样时间步
+        timesteps = torch.randint(
+            0, self.noise_scheduler.config.num_train_timesteps, 
+            (batch_size,), device=device
+        ).long()
+        
+        # 生成噪声
+        noise = torch.randn_like(ground_truth_actions)
+        
+        # 添加噪声到动作
+        noisy_actions = self.noise_scheduler.add_noise(ground_truth_actions, noise, timesteps)
+        
+        # 生成时间步嵌入
+        timestep_embeddings = self.time_encoder(timesteps.float())
+        
+        return {
+            "noise": noise,
+            "noisy_actions": noisy_actions,
+            "timesteps": timesteps,
+            "diffusion_timestep_embeddings": timestep_embeddings
+        }
+    
+    def forward(self, actions_hidden_states, noisy_actions=None, timesteps=None):
+        """前向传播用于训练"""
+        batch_size = actions_hidden_states.shape[0]
+        
+        # 获取时间步嵌入
+        timestep_embeddings = self.time_encoder(timesteps).unsqueeze(1)  # [B, 1, D]
+        timestep_embeddings = timestep_embeddings.repeat(1, NUM_ACTIONS_CHUNK, 1)  # [B, NUM_ACTIONS_CHUNK, D]
+        
+        # 通过transformer处理actions_hidden_states
+        actions_reshaped = actions_hidden_states.reshape(batch_size, -1, self.input_dim)
+        transformer_output = self.transformer(inputs_embeds=actions_reshaped).last_hidden_state
+        
+        # 将transformer输出与噪声动作和时间嵌入拼接，然后送入去噪头
+        b, chunks, _ = noisy_actions.shape
+        concat_features = torch.cat([
+            transformer_output,
+            noisy_actions.reshape(b * chunks, -1),
+            timestep_embeddings.reshape(b * chunks, -1)
+        ], dim=-1)
+        
+        # 预测噪声
+        noise_pred = self.denoising_mlp(concat_features)
+        noise_pred = noise_pred.reshape(b, chunks, -1)
+        
+        return noise_pred
+    
+    def predict_action(self, actions_hidden_states):
+        """多步扩散采样生成动作"""
+        batch_size = actions_hidden_states.shape[0]
+        device = actions_hidden_states.device
+        
+        # 初始化随机噪声作为起点
+        noisy_actions = torch.randn(
+            size=(batch_size, NUM_ACTIONS_CHUNK, self.action_dim),
+            device=device,
+            dtype=actions_hidden_states.dtype,
+        )
+        
+        # 设置推理时间步
+        self.noise_scheduler_eval.set_timesteps(self.num_diffusion_steps)
+        
+        # 逐步去噪
+        for t in self.noise_scheduler_eval.timesteps:
+            # 获取时间步嵌入
+            timesteps = torch.tensor([t]).repeat(batch_size).to(device)
+            
+            # 预测噪声
+            with torch.no_grad():
+                noise_pred = self.forward(
+                    actions_hidden_states, 
+                    noisy_actions=noisy_actions, 
+                    timesteps=timesteps
+                )
+                
+                # 更新去噪动作
+                noisy_actions = self.noise_scheduler_eval.step(
+                    noise_pred, t, noisy_actions
+                ).prev_sample
+                
+        return noisy_actions
+        
+        
+    
         
      
         

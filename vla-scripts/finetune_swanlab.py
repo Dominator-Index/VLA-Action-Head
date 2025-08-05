@@ -102,6 +102,12 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # If True, includes robot proprioceptive state in input
+    
+    # End to End
+    use_end_to_end_diffusion: bool = False  # 如果为True，使用端到端扩散模型作为动作头
+    end_to_end_num_layers: int = 8  # RobotTransformerNet的层数
+    end_to_end_dropout_rate: float = 0.1  # dropout率
+    end_to_end_attn_implementation: str = "eager"  # 注意力实现
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -190,12 +196,20 @@ def get_run_id(cfg) -> str:
         if cfg.image_aug:
             run_id += "--image_aug"
         # === 新增：根据 action head 类型加后缀 ===
-        if cfg.use_vae:
+        if cfg.use_end_to_end_diffusion:
+            run_id += "--EndToEndDiffusion"
+        elif cfg.use_vae:
             run_id += "--VAE"
         elif cfg.use_l1_regression:
             run_id += "--L1"
         elif cfg.use_diffusion:
             run_id += "--diffusion"
+        elif cfg.use_flow_matching:
+            run_id += "--FlowMatching"
+        elif cfg.use_ot_flow_matching:
+            run_id += "--OTFlowMatching"
+        elif cfg.use_cot_flow_matching:
+            run_id += "--COTFlowMatching"
         # === 新增 END ===
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
@@ -296,6 +310,7 @@ def run_forward_pass(
     batch,
     action_tokenizer,
     device_id,
+    use_end_to_end_diffusion,
     use_l1_regression,
     use_diffusion,
     use_vae,
@@ -383,7 +398,7 @@ def run_forward_pass(
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
 
     # Compute metrics for discrete action representation (next-token prediction)
-    if not (use_l1_regression or use_diffusion or use_vae or use_flow_matching):
+    if not (use_l1_regression or use_diffusion or use_vae or use_flow_matching or use_ot_flow_matching or use_end_to_end_diffusion):
         loss = output.loss
         predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
         curr_action_accuracy = compute_token_accuracy(
@@ -421,6 +436,30 @@ def run_forward_pass(
             .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
             .to(torch.bfloat16)
         )  # (B, act_chunk_len, D)
+        
+        if use_end_to_end_diffusion:
+            # 获取噪声动作
+            noisy_dict = action_head.module.sample_noisy_actions(ground_truth_actions)
+            noise, noisy_actions, timesteps = (
+                noisy_dict["noise"],
+                noisy_dict["noisy_actions"],
+                noisy_dict["timesteps"],
+            )
+            
+            # 预测噪声
+            noise_pred = action_head.module.forward(
+                actions_hidden_states, 
+                noisy_actions=noisy_actions, 
+                timesteps=timesteps
+            )
+            
+            # 计算损失
+            loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
+            
+            # 只在需要时采样动作并计算L1损失
+            if compute_diffusion_l1:
+                with torch.no_grad():
+                    predicted_actions = action_head.module.predict_action(actions_hidden_states)
 
         if use_l1_regression:
             # Predict action
@@ -520,6 +559,7 @@ def run_forward_pass(
 
         # Get detailed L1 losses for logging
         should_log_l1_loss = use_flow_matching or (use_l1_regression or use_vae) or (use_diffusion and compute_diffusion_l1)
+# 缺少 use_end_to_end_diffusion
         if should_log_l1_loss:
             ground_truth_curr_action = ground_truth_actions[:, 0]
             predicted_curr_action = predicted_actions[:, 0]
@@ -838,7 +878,7 @@ def save_training_checkpoint(
                 noisy_action_projector.state_dict(), checkpoint_dir / f"noisy_action_projector--{checkpoint_name_suffix}"
             )
 
-        if (cfg.use_l1_regression or cfg.use_diffusion or cfg.use_vae) and action_head is not None:
+        if (cfg.use_l1_regression or cfg.use_diffusion or cfg.use_vae or cfg.use_flow_matching or cfg.use_ot_flow_matching or cfg.use_end_to_end_diffusion) and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
         if cfg.use_film:

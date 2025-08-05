@@ -147,7 +147,8 @@ def validate_config(cfg: GenerateConfig) -> None:
         cfg.use_diffusion, 
         getattr(cfg, "use_flow_matching", False),
         getattr(cfg, "use_ot_flow_matching", False),
-        getattr(cfg, "use_cot_flow_matching", False)  # 添加此行
+        getattr(cfg, "use_cot_flow_matching", False), # 添加此行
+        getattr(cfg, "use_end_to_end_diffusion", False) 
     ])
     assert action_head_types <= 1, "Cannot use multiple action head types simultaneously!"
     
@@ -175,7 +176,7 @@ def initialize_model(cfg: GenerateConfig):
 
     # Load action head if needed
     action_head = None
-    if cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion or cfg.use_flow_matching or cfg.use_ot_flow_matching:
+    if cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion or cfg.use_flow_matching or cfg.use_ot_flow_matching or cfg.use_end_to_end_diffusion:
         action_head = get_action_head(cfg, model.llm_dim)
 
     # Load noisy action projector if using diffusion
@@ -212,7 +213,9 @@ def setup_logging(cfg: GenerateConfig):
     """Set up logging to file and optionally to swanlab."""
     # Create run ID with model type
     model_type = "base"
-    if cfg.use_l1_regression:
+    if cfg.use_end_to_end_diffusion:
+        model_type = "EndToEndDiffusion"
+    elif cfg.use_l1_regression:
         model_type = "L1"
     elif cfg.use_vae:
         model_type = "VAE"
@@ -222,6 +225,7 @@ def setup_logging(cfg: GenerateConfig):
         model_type = "FlowMatching"
     elif cfg.use_ot_flow_matching:
         model_type = "OTFlowMatching"
+        
     
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{model_type}-{DATE_TIME}"
     if cfg.run_id_note is not None:

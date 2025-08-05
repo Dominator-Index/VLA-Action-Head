@@ -24,7 +24,7 @@ json_numpy.patch()
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead, FlowMatchingActionHead, OTFlowMatchingActionHead, OTFlowMatchingActionHead
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead, FlowMatchingActionHead, OTFlowMatchingActionHead, OTFlowMatchingActionHead, COTFlowMatchingActionHead, EndToEndDiffusionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
@@ -280,7 +280,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
 
     # Load the model
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
+        getattr(cfg, "pretrained_checkpoint", "moojink/openvla-7b"),
         # attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
@@ -481,33 +481,44 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         cfg.use_vae, 
         getattr(cfg, "use_flow_matching", False), 
         getattr(cfg, "use_ot_flow_matching", False),
-        getattr(cfg, "use_cot_flow_matching", False)
+        getattr(cfg, "use_cot_flow_matching", False),
+        getattr(cfg, "se_end_to_end_diffusion", False)
     ]) <= 1, "Cannot use more than one action head type!"
 
     # Initialize appropriate action head based on configuration
-    if cfg.use_l1_regression:
+    if getattr(cfg, "use_end_to_end_diffusion", False):
+        return EndToEndDiffusionActionHead(
+            input_dim=llm_dim,
+            hidden_dim=llm_dim,
+            action_dim=ACTION_DIM,
+            num_diffusion_steps=getattr(cfg, "num_diffusion_steps", 50),
+            num_layers=getattr(cfg, "end_to_end_num_layers", 8),
+            dropout_rate=getattr(cfg, "end_to_end_dropout_rate", 0.1),
+            attn_implementation=getattr(cfg, "end_to_end_attn_implementation", False)
+        )
+    if getattr(cfg, "use_l1_regression", "False"):
         action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
-    elif cfg.use_vae:
+    elif getattr(cfg, "use_vae", False):
         action_head = VAEActionHead(
             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, latent_dim=getattr(cfg, "vae_latent_dim", 32)
         )
             
-    elif cfg.use_diffusion:
+    elif getattr(cfg, "use_diffusion", False):
         action_head = DiffusionActionHead(
-            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps=cfg.num_diffusion_steps
+            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps=getattr(cfg, "num_diffusion_steps", 50)
         )
-    elif cfg.use_flow_matching:
+    elif getattr(cfg, "use_flow_matching", False):
         action_head = FlowMatchingActionHead(
             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_flow_steps=getattr(cfg, "num_flow_steps", 20)
         )
-    elif cfg.use_ot_flow_matching:
+    elif getattr(cfg, "use_ot_flow_matching", False):
         action_head = OTFlowMatchingActionHead(
             input_dim=llm_dim, 
             hidden_dim=llm_dim, 
             action_dim=ACTION_DIM,
             num_flow_steps=getattr(cfg, "num_flow_steps", 20)
         )
-    elif cfg.use_cot_flow_matching:
+    elif getattr(cfg, "use_cot_flow_matching", False):
         action_head = COTFlowMatchingActionHead(
             input_dim=llm_dim, 
             hidden_dim=llm_dim, 
@@ -541,6 +552,15 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     else:
         checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_head")
         state_dict = load_component_state_dict(checkpoint_path)
+        if getattr(cfg, "use_diffusion", False):
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("model."):
+                    new_key = k.replace("model.", "noise_predictor.mlp_resnet.")
+                    new_state_dict[new_key] = v
+                else:
+                    new_state_dict[k] = v
+            
         action_head.load_state_dict(state_dict)
 
     return action_head
