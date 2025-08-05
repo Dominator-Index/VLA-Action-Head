@@ -94,6 +94,8 @@ class GenerateConfig:
     vae_latent_dim: int = 64                         # 可选，VAE 潜在空间维度
     use_diffusion: bool = False                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for inference
+    use_flow_matching: bool = False
+    num_flow_steps: int = 20
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input

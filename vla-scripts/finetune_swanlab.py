@@ -42,7 +42,7 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead, FlowMatchingActionHead, OTFlowMatchingActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -79,7 +79,7 @@ class FinetuneConfig:
     dist_rank: Optional[int] = 0
 
     # fmt: off
-    vla_path: str = "/home/ouyangzl/openvla-oft/Finetune_logs_checkpoints/parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state--10000_chkpt"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)   openvla/openvla-7b
+    vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)   openvla/openvla-7b
 
     # Dataset
     data_root_dir: Path = Path("/home/ouyangzl/openvla-oft/modified_libero_rlds")      # Directory containing RLDS datasets
@@ -88,7 +88,7 @@ class FinetuneConfig:
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
-    use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
+    use_l1_regression: bool = False                   # If True, trains continuous action head with L1 regression objective
     use_vae: bool = True
     vae_latent_dim: int = 64                         # (When `use_vae==True`) Latent dimension of VAE
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
@@ -103,14 +103,14 @@ class FinetuneConfig:
     lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
     num_steps_before_decay: int = 100_000            # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
-    max_steps: int = 150005  # 200_000                         # Max number of training steps
+    max_steps: int = 200_000   # 150005                       # Max number of training steps
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
     val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
     val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
-    resume: bool = True                             # If True, resumes from checkpoint
+    resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = 10000                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
@@ -126,7 +126,7 @@ class FinetuneConfig:
     # Logging
     swanlab_project: str = "OpenVLA-oft"        # Name of swanlab project
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
-    run_id_override: Optional[str] = "parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state"            # Optional string to override the run ID with
+    run_id_override: Optional[str] = None
     swanlab_log_freq: int = 10                         # swanlablogging frequency in steps
 
     # fmt: on
@@ -168,12 +168,9 @@ def get_run_id(cfg) -> str:
         str: Experiment run ID.
     """
     if cfg.run_id_override is not None:
-        # Override the run ID with the user-provided ID
         run_id = cfg.run_id_override
     elif cfg.resume:
-        # Override run ID with the previous resumed run's ID
         run_id = cfg.vla_path.split("/")[-1]
-        # Remove the "--XXX_chkpt" suffix from the run ID if it exists
         if "chkpt" in run_id.split("--")[-1]:
             run_id = "--".join(run_id.split("--")[:-1])
     else:
@@ -186,6 +183,14 @@ def get_run_id(cfg) -> str:
             run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
         if cfg.image_aug:
             run_id += "--image_aug"
+        # === 新增：根据 action head 类型加后缀 ===
+        if cfg.use_vae:
+            run_id += "--VAE"
+        elif cfg.use_l1_regression:
+            run_id += "--L1"
+        elif cfg.use_diffusion:
+            run_id += "--diffusion"
+        # === 新增 END ===
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
@@ -335,6 +340,19 @@ def run_forward_pass(
         )
     else:
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
+    
+    # [Only for flow matching] Sample x0, t for training
+    if use_flow_matching:
+        batch_size = batch["inputs"].shape[0]
+        # x1: ground-truth actions (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
+        x1 = ground_truth_actions
+        # x0: Gaussian noise (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
+        x0 = torch.randn_like(x1)
+        # t: Uniform[0,1] (B,)
+        t = torch.rand(batch_size, device=device_id)
+    else:
+        x0, x1, t = None, None, None
+        
 
     # VLA forward pass
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -358,7 +376,7 @@ def run_forward_pass(
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
 
     # Compute metrics for discrete action representation (next-token prediction)
-    if not (use_l1_regression or use_diffusion or use_vae):
+    if not (use_l1_regression or use_diffusion or use_vae or use_flow_matching):
         loss = output.loss
         predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
         curr_action_accuracy = compute_token_accuracy(
@@ -438,14 +456,39 @@ def run_forward_pass(
                         use_film=use_film,
                     )
 
+        if use_flow_matching:
+            # === Flow Matching Loss ===
+            loss = action_head.module.compute_flow_matching_loss(
+                x0, x1, t, actions_hidden_states
+            )
+            # 推理/评估时采样动作
+            with torch.no_grad():
+                predicted_actions = run_flow_matching_sampling(
+                    vla=vla,
+                    action_head=action_head,
+                    proprio_projector=proprio_projector,
+                    batch=batch,
+                    batch_size=batch_size,
+                    num_patches=num_patches,
+                    actions_shape=ground_truth_actions.shape,
+                    device_id=device_id,
+                    current_action_mask=current_action_mask,
+                    next_actions_mask=next_actions_mask,
+                    use_proprio=use_proprio,
+                    use_film=use_film,
+                )
+        
         metrics.update(
             {
                 "loss_value": loss.item(),  # Detached value for logging
             }
         )
-
+        
+        if use_flow_matching:
+            
+        
         # Get detailed L1 losses for logging
-        should_log_l1_loss = (use_l1_regression or use_vae) or (use_diffusion and compute_diffusion_l1)
+        should_log_l1_loss = use_flow_matching or (use_l1_regression or use_vae) or (use_diffusion and compute_diffusion_l1)
         if should_log_l1_loss:
             ground_truth_curr_action = ground_truth_actions[:, 0]
             predicted_curr_action = predicted_actions[:, 0]
@@ -551,6 +594,58 @@ def run_diffusion_sampling(
         curr_noisy_actions = action_head.module.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
 
     return curr_noisy_actions.reshape(actions_shape)
+
+def run_flow_matching_sampling(
+    vla,
+    action_head,
+    proprio_projector,
+    batch,
+    batch_size,
+    num_patches,
+    actions_shape,
+    device_id,
+    current_action_mask,
+    next_actions_mask,
+    use_proprio,
+    use_film,
+) -> torch.Tensor:
+    """
+    多步采样flow matching生成动作。
+    """
+    # 初始点x0 ~ N(0, I)
+    x0 = torch.randn(
+        size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM),
+        device=device_id,
+        dtype=torch.bfloat16,
+    )
+    num_steps = action_head.module.num_flow_steps
+
+    x = x0
+    t_vals = torch.linspace(0, 1, num_steps + 1, device=device_id)
+    dt = 1.0 / num_steps
+
+    for i in range(num_steps):
+        t_scalar = t_vals[i].expand(batch_size)
+        t_emb = action_head.module.time_encoder(t_scalar).unsqueeze(1)  # (B, 1, D)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output = vla(
+                input_ids=batch["input_ids"].to(device_id),
+                attention_mask=batch["attention_mask"].to(device_id),
+                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                labels=batch["labels"],
+                output_hidden_states=True,
+                proprio=batch["proprio"] if use_proprio else None,
+                proprio_projector=proprio_projector if use_proprio else None,
+                use_film=use_film,
+            )
+            last_hidden_states = output.hidden_states[-1]
+            text_hidden_states = last_hidden_states[:, num_patches:-1]
+            actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(
+                batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
+            ).to(torch.bfloat16)
+            v = action_head.module.forward(actions_hidden_states, t_emb)
+            x = x + v * dt
+    return x.reshape(actions_shape)
 
 
 def compute_smoothened_metrics(metrics_deques) -> dict:
@@ -971,6 +1066,36 @@ def finetune(cfg: FinetuneConfig) -> None:
         noisy_action_projector = init_module(
             NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
         )
+    
+    if getattr(cfg, "use_flow_matching", False):
+        action_head = init_module(
+            FlowMatchingActionHead,
+            "action_head",
+            cfg,
+            device_id,
+            {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": vla.module.llm_dim,
+                "action_dim": ACTION_DIM,
+                "num_flow_steps": getattr(cfg, "num_flow_steps", 20),
+            },
+            to_bf16=True,
+        )
+        
+    if getattr(cfg, "use_ot_flow_matching", False):
+        action_head = init_module(
+            OTFlowMatchingActionHead,
+            "action_head",
+            cfg,
+            device_id,
+            {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": vla.module.llm_dim,
+                "action_dim": ACTION_DIM,
+                "num_flow_steps": getattr(cfg, "num_flow_steps", 20),
+            },
+            to_bf16=True,
+        )
 
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
@@ -980,6 +1105,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
     if cfg.use_diffusion:
         NUM_PATCHES += 1
+    if cfg.use_flow_matching:
+        NUM_PATCHES += 1
+    if cfg.use_ot_flow_matching:
+        NUM_PATCHES += 1
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
@@ -987,6 +1116,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in action_head.parameters() if param.requires_grad]
     if cfg.use_diffusion:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
+    if cfg.use_flow_matching:
+        trainable_params += [param for param in action_head.parameters() if param.requires_grad]
+    if cfg.use_ot_flow_matching:
+        trainable_params += [param for param in action_head.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
@@ -1104,11 +1237,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_l1_regression=cfg.use_l1_regression,
                 use_vae=cfg.use_vae,
                 use_diffusion=cfg.use_diffusion,
+                use_flow_matching=cfg.use_flow_matching,
+                use_ot_flow_matching=cfg.use_ot_flow_matching,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,
+                num_flow_steps=cfg.num_flow_steps if cfg.use_flow_matching else None,
             )
 
             # Normalize loss to account for gradient accumulation

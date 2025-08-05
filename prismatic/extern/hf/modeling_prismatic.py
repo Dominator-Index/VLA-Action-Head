@@ -790,92 +790,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         return actions
 
-    def _run_diffusion_prediction(
-        self,
-        input_embeddings,
-        all_actions_mask,
-        noise,
-        action_head,
-        projected_patch_embeddings,
-        labels,
-        attention_mask,
-        NUM_PATCHES,
-        NUM_PROMPT_TOKENS,
-        noisy_action_projector,
-    ):
-        """Run diffusion-based action prediction"""
-        # Set diffusion timestep values
-        action_head.noise_scheduler.set_timesteps(action_head.num_diffusion_steps)
-        # Clone embedding for reuse in each timestep
-        orig_projected_patch_embeddings = projected_patch_embeddings.clone()
-        curr_noisy_actions = noise
-
-        # Reverse diffusion: Iteratively denoise to generate action prediction
-        for t in action_head.noise_scheduler.timesteps:
-            # Get diffusion model's noise prediction (conditioned on VLA latent embedding, current noisy action
-            # embedding, and diffusion timestep embedding)
-            timesteps = torch.Tensor([t]).to(labels.device)
-            diffusion_timestep_embeddings = (
-                action_head.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
-            )  # (B, llm_dim)
-            diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)  # (B, 1, llm_dim)
-
-            # [Diffusion] Replace the embeddings of the action tokens with noisy actions
-            # (Later on, the positional embeddings will be added to them)
-
-            # For simplicity, append diffusion timestep embedding to the end of projected vision tokens
-            projected_patch_embeddings = torch.cat(
-                (orig_projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
-            )
-
-            # Reshape and project noisy actions into language embedding space
-            B = curr_noisy_actions.shape[0]
-            orig_curr_noisy_actions_shape = curr_noisy_actions.shape
-            curr_noisy_actions = curr_noisy_actions.reshape(B, -1).unsqueeze(-1)
-            noisy_action_features = noisy_action_projector(curr_noisy_actions)
-            curr_noisy_actions = curr_noisy_actions.reshape(orig_curr_noisy_actions_shape)
-
-            # Replace action token embeddings with noisy action embeddings
-            input_embeddings = self._replace_input_embeddings(
-                input_embeddings.clone(), all_actions_mask, noisy_action_features
-            )
-
-            # Build multimodal embeddings and attention mask
-            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-                input_embeddings, projected_patch_embeddings, attention_mask
-            )
-
-            # Forward pass through language model
-            language_model_output = self.language_model(
-                input_ids=None,
-                attention_mask=multimodal_attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=multimodal_embeddings,
-                labels=None,
-                use_cache=None,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-
-            # Extract hidden states for action portion of response
-            last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-            actions_hidden_states = last_hidden_states[
-                :,
-                NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-                :,
-            ]  # (B, act_chunk_len, D)
-
-            # Predict noise and update noisy actions: x_t -> x_{t-1}
-            noise_pred = action_head.predict_noise(actions_hidden_states)
-            curr_noisy_actions = action_head.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
-
-        curr_noisy_actions = curr_noisy_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
-
-        # Return final actions
-        return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states
-
     def _regression_or_discrete_prediction(
         self,
         input_embeddings,
@@ -1135,7 +1049,146 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         vae_actions = vae_actions.float().cpu().detach().numpy()
         
         return vae_actions, actions_hidden_states
-        
+    
+    def _run_diffusion_prediction(
+        self,
+        input_embeddings,
+        all_actions_mask,
+        noise,
+        action_head,
+        projected_patch_embeddings,
+        labels,
+        attention_mask,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+        noisy_action_projector,
+    ):
+        """Run diffusion-based action prediction"""
+        # Set diffusion timestep values
+        action_head.noise_scheduler.set_timesteps(action_head.num_diffusion_steps)
+        # Clone embedding for reuse in each timestep
+        orig_projected_patch_embeddings = projected_patch_embeddings.clone()
+        curr_noisy_actions = noise
+
+        # Reverse diffusion: Iteratively denoise to generate action prediction
+        for t in action_head.noise_scheduler.timesteps:
+            # Get diffusion model's noise prediction (conditioned on VLA latent embedding, current noisy action
+            # embedding, and diffusion timestep embedding)
+            timesteps = torch.Tensor([t]).to(labels.device)
+            diffusion_timestep_embeddings = (
+                action_head.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
+            )  # (B, llm_dim)
+            diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)  # (B, 1, llm_dim)
+
+            # [Diffusion] Replace the embeddings of the action tokens with noisy actions
+            # (Later on, the positional embeddings will be added to them)
+
+            # For simplicity, append diffusion timestep embedding to the end of projected vision tokens
+            projected_patch_embeddings = torch.cat(
+                (orig_projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
+            )
+
+            # Reshape and project noisy actions into language embedding space
+            B = curr_noisy_actions.shape[0]
+            orig_curr_noisy_actions_shape = curr_noisy_actions.shape
+            curr_noisy_actions = curr_noisy_actions.reshape(B, -1).unsqueeze(-1)
+            noisy_action_features = noisy_action_projector(curr_noisy_actions)
+            curr_noisy_actions = curr_noisy_actions.reshape(orig_curr_noisy_actions_shape)
+
+            # Replace action token embeddings with noisy action embeddings
+            input_embeddings = self._replace_input_embeddings(
+                input_embeddings.clone(), all_actions_mask, noisy_action_features
+            )
+
+            # Build multimodal embeddings and attention mask
+            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+                input_embeddings, projected_patch_embeddings, attention_mask
+            )
+
+            # Forward pass through language model
+            language_model_output = self.language_model(
+                input_ids=None,
+                attention_mask=multimodal_attention_mask,
+                position_ids=None,
+                past_key_values=None,
+                inputs_embeds=multimodal_embeddings,
+                labels=None,
+                use_cache=None,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+            # Extract hidden states for action portion of response
+            last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+            actions_hidden_states = last_hidden_states[
+                :,
+                NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+                :,
+            ]  # (B, act_chunk_len, D)
+
+            # Predict noise and update noisy actions: x_t -> x_{t-1}
+            noise_pred = action_head.predict_noise(actions_hidden_states)
+            curr_noisy_actions = action_head.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
+
+        curr_noisy_actions = curr_noisy_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+
+        # Return final actions
+        return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states
+       
+    
+    def _run_flow_matching_prediction(
+    self,
+    input_embeddings,
+    all_actions_mask,
+    projected_patch_embeddings,
+    attention_mask,
+    labels,
+    NUM_PATCHES,
+    NUM_PROMPT_TOKENS,
+    action_head,
+):
+    """
+    多步采样推理，和 diffusion 类似，每步注入时间编码
+    """
+    # 1. Zero out action token embeddings
+    all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+    input_embeddings = input_embeddings * ~all_actions_mask
+
+    # 2. Build multimodal embeddings & attention mask
+    multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+        input_embeddings, projected_patch_embeddings, attention_mask
+    )
+
+    # 3. Forward pass through language model
+    language_model_output = self.language_model(
+        input_ids=None,
+        attention_mask=multimodal_attention_mask,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=multimodal_embeddings,
+        labels=None,
+        use_cache=None,
+        output_attentions=False,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    # 4. 提取动作token的hidden state
+    last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+    actions_hidden_states = last_hidden_states[
+        :,
+        NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+        :,
+    ]  # (B, act_chunk_len, D)
+
+    # 5. 多步采样
+    predicted_actions = action_head.predict_action(actions_hidden_states)  # (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
+    predicted_actions = predicted_actions[0] if predicted_actions.shape[0] == 1 else predicted_actions
+    predicted_actions = predicted_actions.float().cpu().detach().numpy()
+    return predicted_actions, actions_hidden_states
+    
+     
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
         """Validate and resolve the unnormalization key for action statistics"""

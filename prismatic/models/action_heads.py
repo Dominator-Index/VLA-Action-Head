@@ -8,6 +8,11 @@ import torch.nn as nn
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
 
+# Add conditional flow matching 
+from torchcfm.conditional_flow_matching import *
+from torchcfm.models.models import *
+from torchcfm.utils import *
+from torchcfm.optimal_transport import OTPlanSampler
 
 class SinusoidalPositionalEncoding(nn.Module):
     """
@@ -109,12 +114,12 @@ class L1RegressionActionHead(nn.Module):
 
 class VAEActionHead(nn.Module):
     """
-    Variational Autoencoder (VAE)-based action head for continuous action prediction.
-    编码 action hidden states 到潜在空间，采样后解码生成动作。
+    Chunk-wise VAE-based action head for continuous action prediction.
+    每个 chunk 独立编码/解码，结构与 L1RegressionActionHead 对齐，便于公平对比。
     """
-    
     def __init__(
-        self, input_dim=4096,
+        self,
+        input_dim=4096,
         hidden_dim=4096,
         action_dim=7,
         latent_dim=32,
@@ -122,83 +127,68 @@ class VAEActionHead(nn.Module):
         super().__init__()
         self.action_dim = action_dim
         self.latent_dim = latent_dim
-        
-        # 编码器：输入为 (batch, chunk_len * action_dim, input_dim)，flatten后为 (batch, chunk_len * action_dim * input_dim)
+
+        # 与 L1RegressionActionHead 保持一致：每个 chunk 一个 MLP
         self.encoder = MLPResNet(
             num_blocks=2,
-            input_dim=input_dim * NUM_ACTIONS_CHUNK * action_dim // ACTION_DIM,  # input_dim * chunk_len
+            input_dim=input_dim * action_dim,
             hidden_dim=hidden_dim,
             output_dim=hidden_dim,
         )
         self.fc_mu = nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
-
-        # 解码器：输入 latent，输出 (batch, chunk_len * action_dim)
         self.decoder = MLPResNet(
             num_blocks=2,
             input_dim=latent_dim,
             hidden_dim=hidden_dim,
-            output_dim=NUM_ACTIONS_CHUNK * action_dim,
+            output_dim=action_dim,
         )
-    
+
     def encode(self, actions_hidden_states):
-        # actions_hidden_states: (batch, chunk_len * action_dim, input_dim)
+        # actions_hidden_states: (batch, NUM_ACTIONS_CHUNK, action_dim * input_dim)
         batch_size = actions_hidden_states.shape[0]
-        x = actions_hidden_states.reshape(batch_size, -1)  # Flatten to (batch_size, chunk_len * action_dim * input_dim)
-        h = self.encoder(x)  # (batch_size, hidden_dim)
-        mu = self.fc_mu(h)  # (batch_size, latent_dim)
-        logvar = self.fc_logvar(h)  # (batch_size, latent_dim)
+        chunk = actions_hidden_states.shape[1]
+        x = actions_hidden_states  # (batch, chunk, action_dim * input_dim)
+        h = self.encoder(x)        # (batch, chunk, hidden_dim)
+        mu = self.fc_mu(h)         # (batch, chunk, latent_dim)
+        logvar = self.fc_logvar(h) # (batch, chunk, latent_dim)
         return mu, logvar
-    
+
     def reparameterize(self, mu, logvar):
-        # 采样 latent 向量
         std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std, device=std.device)
+        eps = torch.randn_like(std)
         return mu + eps * std
-    
+
     def decode(self, z):
-        # z: (batch, latent_dim)
-        recon = self.decoder(z)  # (batch_size, chunk_len * action_dim)
-        recon = recon.view(-1, NUM_ACTIONS_CHUNK, self.action_dim)  # (batch, chunk_len, action_dim)
+        # z: (batch, chunk, latent_dim)
+        recon = self.decoder(z)  # (batch, chunk, action_dim)
         return recon
 
     def forward(self, actions_hidden_states):
-        """
-        前向传播，返回重构的 action、均值、对数方差
-        actions_hidden_states: (batch, chunk_len * action_dim, input_dim)
-        """
-        mu, logvar = self.encode(actions_hidden_states)  # (batch, latent_dim)
-        z = self.reparameterize(mu, logvar)  # (batch, latent_dim)
-        recon_actions = self.decode(z)  # (batch, chunk_len, action_dim)
+        # actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
+        batch_size = actions_hidden_states.shape[0]
+        # reshape to (batch, NUM_ACTIONS_CHUNK, action_dim * input_dim)
+        x = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon_actions = self.decode(z)  # (batch, chunk, action_dim)
         return recon_actions, mu, logvar
-    
+
     def get_vae_loss(self, actions_hidden_states, ground_truth_actions, batch_size=None, device_id=None, beta=1.0):
-        """
-        计算 VAE 损失（重构损失 + KL 散度）
-        actions_hidden_states: (batch, act_chunk_len, hidden_dim)
-        ground_truth_actions: (batch, act_chunk_len, action_dim)
-        """
-        recon_actions, mu, logvar = self.forward(actions_hidden_states)  # (batch, act_chunk_len, action_dim), (batch, latent_dim), (batch, latent_dim)
-        # 重构损失（L2）
-        recon_loss = torch.nn.functional.mse_loss(recon_actions, ground_truth_actions, reduction='mean')  # (batch, act_chunk_len, action_dim)
-        # KL 散度
-        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())  # (batch, latent_dim)
-        # 总损失
-        loss = recon_loss + beta * kl_loss  # beta 是 KL 散度的权重
+        # actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
+        # ground_truth_actions: (batch, NUM_ACTIONS_CHUNK, action_dim)
+        recon_actions, mu, logvar = self.forward(actions_hidden_states)
+        recon_loss = torch.nn.functional.mse_loss(recon_actions, ground_truth_actions, reduction='mean')
+        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        loss = recon_loss + beta * kl_loss
         return loss
-    
+
     def predict_action(self, actions_hidden_states):
-        """
-        推理时只用均值，不加噪声
-        actions_hidden_states: (batch, chunk_len * action_dim, input_dim)
-        返回: (batch, chunk_len, action_dim)
-        """
-        mu, _ = self.encode(actions_hidden_states)
+        batch_size = actions_hidden_states.shape[0]
+        x = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+        mu, _ = self.encode(x)
         recon_action = self.decode(mu)
         return recon_action
-        
-    
-
     
 class NoisePredictionModel(nn.Module):
     """
@@ -302,3 +292,84 @@ class DiffusionActionHead(nn.Module):
         # Get diffusion model's noise prediction.
         noise_pred = self.noise_predictor(rearranged_actions_hidden_states)
         return noise_pred
+
+class FlowMatchingActionHead(nn.Module):
+    """
+    MLP-based action head for flow matching, consistent with L1RegressionActionHead/VAEActionHead/DiffusionActionHead.
+    支持多步采样推理，每步注入时间编码。
+    """
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+        num_flow_steps=20,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_flow_steps = num_flow_steps
+        self.time_encoder = SinusoidalPositionalEncoding(dim=hidden_dim)
+        # 输入: [batch, NUM_ACTIONS_CHUNK, action_dim * input_dim + hidden_dim]
+        self.model = MLPResNet(
+            num_blocks=2,
+            input_dim=input_dim * action_dim + hidden_dim,  # 拼接时间编码
+            hidden_dim=hidden_dim,
+            output_dim=action_dim,
+        )
+
+    def forward(self, actions_hidden_states, t_emb):
+        """
+        actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
+        t_emb: (batch, 1, hidden_dim)  # 每个样本的时间步编码
+        return: (batch, NUM_ACTIONS_CHUNK, action_dim)
+        """
+        batch_size = actions_hidden_states.shape[0]
+        # (batch, NUM_ACTIONS_CHUNK, action_dim * input_dim)
+        x = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+        # t_emb: (batch, 1, hidden_dim) -> broadcast到NUM_ACTIONS_CHUNK
+        t_emb = t_emb.expand(-1, NUM_ACTIONS_CHUNK, -1)
+        x = torch.cat([x, t_emb], dim=-1)  # (batch, NUM_ACTIONS_CHUNK, action_dim * input_dim + hidden_dim)
+        vector_field = self.model(x)  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        return vector_field
+    
+    def compute_flow_matching_loss(self, x0, x1, t, actions_hidden_states):
+        """
+        x0: (batch, NUM_ACTIONS_CHUNK, action_dim)  # 源点（如高斯噪声）
+        x1: (batch, NUM_ACTIONS_CHUNK, action_dim)  # 目标（真实动作）
+        t: (batch,) or (batch, 1)                  # 路径采样时间
+        actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
+        """
+        t = t.view(-1, 1, 1)  # (batch, 1, 1)
+        x_t = (1 - t) * x0 + t * x1  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        u_t = x1 - x0  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        # 时间编码
+        t_scalar = t.view(-1)  # (batch,)
+        t_emb = self.time_encoder(t_scalar)  # (batch, hidden_dim)
+        t_emb = t_emb.unsqueeze(1)  # (batch, 1, hidden_dim)
+        flow_pred = self.forward(actions_hidden_states, t_emb)  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        loss = torch.nn.functional.mse_loss(flow_pred, u_t)
+        return loss
+    
+class OTFlowMatchingActionHead(FlowMatchingActionHead):
+    """
+    Optimal Transport Flow Matching Action Head, which uses optimal transport to sample paths between source and target actions.
+    """
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+        num_flow_steps=20,
+        ot_plan_sampler=None,  # Optional OTPlanSampler instance
+    ):
+        super().__init__(input_dim, hidden_dim, action_dim, num_flow_steps)
+        self.ot_plan_sampler = ot_plan_sampler if ot_plan_sampler is not None else OTPlanSampler()
+    
+
+        
+     
+        
+        
+    
+    
+    
