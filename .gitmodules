@@ -7,3 +7,6 @@
 [submodule "CFM"]
 	path = CFM
 	url = git@github.com:Dominator-Index/conditional-flow-matching.git
+[submodule "Dita"]
+	path = Dita
+	url = git@github:Dominator-Index/Dita
