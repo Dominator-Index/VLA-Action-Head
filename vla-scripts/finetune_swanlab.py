@@ -13,7 +13,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, Optional, Tuple, Type, List
 from dataclasses import asdict
 
 import draccus
@@ -82,9 +82,9 @@ class FinetuneConfig:
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)   openvla/openvla-7b
 
     # Dataset
-    data_root_dir: Path = Path("/home/ouyangzl/openvla-oft/modified_libero_rlds")      # Directory containing RLDS datasets
+    data_root_dir: Path = Path("/jumbo/yaoqingyang/ouyangzhuoli/Robotics/Data/modified_libero_rlds")      # Directory containing RLDS datasets
     dataset_name: str = "libero_spatial_no_noops"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
-    run_root_dir: Path = Path("/home/ouyangzl/openvla-oft/Finetune_logs_checkpoints")               # Path to directory to store logs & checkpoints
+    run_root_dir: Path = Path("/jumbo/yaoqingyang/ouyangzhuoli/Robotics/VLA-Action-Head/Finetune_logs_checkpoints")               # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
@@ -93,6 +93,12 @@ class FinetuneConfig:
     vae_latent_dim: int = 64                         # (When `use_vae==True`) Latent dimension of VAE
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for training
+    use_flow_matching: bool = False
+    use_ot_flow_matching: bool = False
+    use_cot_flow_matching: bool = False
+    num_flow_matching_steps: int = 20
+    condition_coordinates: Optional[List[int]] = None  # Which action dimensions to use as conditions
+    cot_eps: float = 0.1  # Epsilon parameter for COT
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # If True, includes robot proprioceptive state in input
@@ -282,7 +288,6 @@ def init_module(
 
     return wrap_ddp(module, device_id, find_unused_params)
 
-
 def run_forward_pass(
     vla,
     action_head,
@@ -294,6 +299,8 @@ def run_forward_pass(
     use_l1_regression,
     use_diffusion,
     use_vae,
+    use_flow_matching,
+    use_ot_flow_matching,
     use_proprio,
     use_film,
     num_patches,
@@ -478,15 +485,39 @@ def run_forward_pass(
                     use_film=use_film,
                 )
         
+        if use_ot_flow_matching:
+            # Similar to flow matching but using OT matching
+            batch_size = batch["inputs"].shape[0]
+            x1 = ground_truth_actions
+            x0 = torch.randn_like(x1)
+            t = torch.rand(batch_size, device=device_id)
+                
+            # Use OT specific compute_flow_matching_loss
+            loss = action_head.module.compute_flow_matching_loss(x0, x1, t, actions_hidden_states)
+                
+            # For evaluation, use the same sampling function as flow matching
+            with torch.no_grad():
+                predicted_actions = run_ot_flow_matching_sampling(
+                    vla=vla,
+                    action_head=action_head,
+                    proprio_projector=proprio_projector,
+                    batch=batch,
+                    batch_size=batch_size,
+                    num_patches=num_patches,
+                    actions_shape=ground_truth_actions.shape,
+                    device_id=device_id,
+                    current_action_mask=current_action_mask,
+                    next_actions_mask=next_actions_mask,
+                    use_proprio=use_proprio,
+                    use_film=use_film,
+                )
+        
         metrics.update(
             {
                 "loss_value": loss.item(),  # Detached value for logging
             }
         )
-        
-        if use_flow_matching:
-            
-        
+
         # Get detailed L1 losses for logging
         should_log_l1_loss = use_flow_matching or (use_l1_regression or use_vae) or (use_diffusion and compute_diffusion_l1)
         if should_log_l1_loss:
@@ -613,14 +644,13 @@ def run_flow_matching_sampling(
     多步采样flow matching生成动作。
     """
     # 初始点x0 ~ N(0, I)
-    x0 = torch.randn(
+    x = torch.randn(
         size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM),
         device=device_id,
         dtype=torch.bfloat16,
     )
     num_steps = action_head.module.num_flow_steps
 
-    x = x0
     t_vals = torch.linspace(0, 1, num_steps + 1, device=device_id)
     dt = 1.0 / num_steps
 
@@ -643,11 +673,64 @@ def run_flow_matching_sampling(
             actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(
                 batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
             ).to(torch.bfloat16)
-            v = action_head.module.forward(actions_hidden_states, t_emb)
+            # 将当前位置 x 作为输入传递给模型
+            v = action_head.module.forward(actions_hidden_states, t_emb, x)  # 正确传递x参数
             x = x + v * dt
     return x.reshape(actions_shape)
 
+def run_ot_flow_matching_sampling(
+    vla,
+    action_head,
+    proprio_projector,
+    batch,
+    batch_size,
+    num_patches,
+    actions_shape,
+    device_id,
+    current_action_mask,
+    next_actions_mask,
+    use_proprio,
+    use_film,
+) -> torch.Tensor:
+    """
+    OT Flow Matching采样函数 - 采样过程与标准Flow Matching相同，
+    区别只在训练时使用OT计划进行损失计算
+    """
+    # 与flow_matching_sampling相同的实现
+    # 初始点x0 ~ N(0, I)
+    x = torch.randn(
+        size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM),
+        device=device_id,
+        dtype=torch.bfloat16,
+    )
+    num_steps = action_head.module.num_flow_steps
 
+    t_vals = torch.linspace(0, 1, num_steps + 1, device=device_id)
+    dt = 1.0 / num_steps
+
+    for i in range(num_steps):
+        t_scalar = t_vals[i].expand(batch_size)
+        t_emb = action_head.module.time_encoder(t_scalar).unsqueeze(1)  # (B, 1, D)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output = vla(
+                input_ids=batch["input_ids"].to(device_id),
+                attention_mask=batch["attention_mask"].to(device_id),
+                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                labels=batch["labels"],
+                output_hidden_states=True,
+                proprio=batch["proprio"] if use_proprio else None,
+                proprio_projector=proprio_projector if use_proprio else None,
+                use_film=use_film,
+            )
+            last_hidden_states = output.hidden_states[-1]
+            text_hidden_states = last_hidden_states[:, num_patches:-1]
+            actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(
+                batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
+            ).to(torch.bfloat16)
+            v = action_head.module.forward(actions_hidden_states, t_emb, x)  # 正确传递x参数
+            x = x + v * dt
+    return x.reshape(actions_shape)
+    
 def compute_smoothened_metrics(metrics_deques) -> dict:
     """
     Compute smoothened metrics from recent deques.

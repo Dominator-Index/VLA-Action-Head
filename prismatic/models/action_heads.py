@@ -317,10 +317,11 @@ class FlowMatchingActionHead(nn.Module):
             output_dim=action_dim,
         )
 
-    def forward(self, actions_hidden_states, t_emb):
+    def forward(self, actions_hidden_states, t_emb, x_t):
         """
         actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
         t_emb: (batch, 1, hidden_dim)  # 每个样本的时间步编码
+        x_t: (batch, NUM_ACTIONS_CHUNK, action_dim)  # 当前位置
         return: (batch, NUM_ACTIONS_CHUNK, action_dim)
         """
         batch_size = actions_hidden_states.shape[0]
@@ -328,7 +329,8 @@ class FlowMatchingActionHead(nn.Module):
         x = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
         # t_emb: (batch, 1, hidden_dim) -> broadcast到NUM_ACTIONS_CHUNK
         t_emb = t_emb.expand(-1, NUM_ACTIONS_CHUNK, -1)
-        x = torch.cat([x, t_emb], dim=-1)  # (batch, NUM_ACTIONS_CHUNK, action_dim * input_dim + hidden_dim)
+        # 拼接特征、时间编码和当前位置
+        x = torch.cat([x, t_emb, x_t], dim=-1)  
         vector_field = self.model(x)  # (batch, NUM_ACTIONS_CHUNK, action_dim)
         return vector_field
     
@@ -336,7 +338,7 @@ class FlowMatchingActionHead(nn.Module):
         """
         x0: (batch, NUM_ACTIONS_CHUNK, action_dim)  # 源点（如高斯噪声）
         x1: (batch, NUM_ACTIONS_CHUNK, action_dim)  # 目标（真实动作）
-        t: (batch,) or (batch, 1)                  # 路径采样时间
+        t: (batch,) or (batch, 1)                   # 路径采样时间
         actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
         """
         t = t.view(-1, 1, 1)  # (batch, 1, 1)
@@ -346,7 +348,8 @@ class FlowMatchingActionHead(nn.Module):
         t_scalar = t.view(-1)  # (batch,)
         t_emb = self.time_encoder(t_scalar)  # (batch, hidden_dim)
         t_emb = t_emb.unsqueeze(1)  # (batch, 1, hidden_dim)
-        flow_pred = self.forward(actions_hidden_states, t_emb)  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        # 将x_t作为输入传递给模型
+        flow_pred = self.forward(actions_hidden_states, t_emb, x_t)  # (batch, NUM_ACTIONS_CHUNK, action_dim)
         loss = torch.nn.functional.mse_loss(flow_pred, u_t)
         return loss
     
@@ -363,8 +366,94 @@ class OTFlowMatchingActionHead(FlowMatchingActionHead):
         ot_plan_sampler=None,  # Optional OTPlanSampler instance
     ):
         super().__init__(input_dim, hidden_dim, action_dim, num_flow_steps)
-        self.ot_plan_sampler = ot_plan_sampler if ot_plan_sampler is not None else OTPlanSampler()
-    
+        self.ot_plan_sampler = ot_plan_sampler if ot_plan_sampler is not None else OTPlanSampler(method='exact')
+        
+    def compute_flow_matching_loss(self, x0, x1, t, actions_hidden_states):
+        """
+        Use optimal transport to find correspondences between source and target samples before computing loss.
+        
+        Args:
+            x0: (batch, NUM_ACTIONS_CHUNK, action_dim)  # Source points (random noise)
+            x1: (batch, NUM_ACTIONS_CHUNK, action_dim)  # Target points (ground truth actions)
+            t: (batch,) or (batch, 1)                  # Path sampling time
+            actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
+        """
+        # Get OT matched pairs
+        x0_ot, x1_ot = self.ot_plan_sampler.sample_plan(x0, x1)
+        
+        # Now proceed with standard flow matching using OT matched pairs
+        t = t.view(-1, 1, 1)  # (batch, 1, 1)
+        x_t = (1 - t) * x0_ot + t * x1_ot  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        u_t = x1_ot - x0_ot  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        
+        # Time encoding
+        t_scalar = t.view(-1)  # (batch,)
+        t_emb = self.time_encoder(t_scalar)  # (batch, hidden_dim)
+        t_emb = t_emb.unsqueeze(1)  # (batch, 1, hidden_dim)
+        
+        # Predict flow vector field
+        flow_pred = self.forward(actions_hidden_states, t_emb, x_t)  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        
+        # Compute loss
+        loss = torch.nn.functional.mse_loss(flow_pred, u_t)
+        return loss
+        
+class COTFlowMatchingActionHead(OTFlowMatchingActionHead):
+    """
+    Conditional Optimal Transport Flow Matching Action Head.
+    Uses a conditional OT plan that depends on task conditions.
+    """    
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+        num_flow_steps=20,
+        condition_coordinates=None,
+        eps=0.1,
+    ):
+        super().__init__(input_dim, hidden_dim, action_dim, num_flow_steps)
+        
+        # Default to using first half of dimensions as condition coordinates if not specified
+        if condition_coordinates is None:
+            condition_coordinates = list(range(action_dim // 2))
+        
+        # Create a batch COT plan sampler
+        from cot import BatchCOTPlanSampler
+        self.ot_plan_sampler = BatchCOTPlanSampler(
+            condition_coordinates=condition_coordinates,
+            eps=eps,
+            method="exact"
+        )
+        
+    def compute_flow_matching_loss(self, x0, x1, t, actions_hidden_states):
+        """
+        Use conditional optimal transport to find correspondences between source
+        and target samples before computing loss.
+        
+        The difference from regular OT is that COT considers conditional information
+        when computing the transport plan.
+        """
+        # Get COT matched pairs
+        x0_cot, x1_cot = self.ot_plan_sampler.sample_plan(x0, x1)
+        
+        # Now proceed with standard flow matching using COT matched pairs
+        t = t.view(-1, 1, 1)  # (batch, 1, 1)
+        x_t = (1 - t) * x0_cot + t * x1_cot  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        u_t = x1_cot - x0_cot  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        
+        # Time encoding
+        t_scalar = t.view(-1)  # (batch,)
+        t_emb = self.time_encoder(t_scalar)  # (batch, hidden_dim)
+        t_emb = t_emb.unsqueeze(1)  # (batch, 1, hidden_dim)
+        
+        # Predict flow vector field - 正确传递 x_t 参数
+        flow_pred = self.forward(actions_hidden_states, t_emb, x_t)  # (batch, NUM_ACTIONS_CHUNK, action_dim)
+        
+        # Compute loss
+        loss = torch.nn.functional.mse_loss(flow_pred, u_t)
+        return loss
+
 
         
      

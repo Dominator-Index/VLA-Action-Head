@@ -1138,56 +1138,83 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
        
     
     def _run_flow_matching_prediction(
-    self,
-    input_embeddings,
-    all_actions_mask,
-    projected_patch_embeddings,
-    attention_mask,
-    labels,
-    NUM_PATCHES,
-    NUM_PROMPT_TOKENS,
-    action_head,
-):
-    """
-    多步采样推理，和 diffusion 类似，每步注入时间编码
-    """
-    # 1. Zero out action token embeddings
-    all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
-    input_embeddings = input_embeddings * ~all_actions_mask
+        self,
+        input_embeddings,
+        all_actions_mask,
+        projected_patch_embeddings,
+        attention_mask,
+        labels,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+        action_head,
+    ):
+        """Run flow matching prediction."""
+        # Zero out action token embeddings
+        all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+        input_embeddings = input_embeddings * ~all_actions_mask
 
-    # 2. Build multimodal embeddings & attention mask
-    multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-        input_embeddings, projected_patch_embeddings, attention_mask
-    )
+        # Build multimodal embeddings & attention mask
+        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+            input_embeddings, projected_patch_embeddings, attention_mask
+        )
 
-    # 3. Forward pass through language model
-    language_model_output = self.language_model(
-        input_ids=None,
-        attention_mask=multimodal_attention_mask,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=multimodal_embeddings,
-        labels=None,
-        use_cache=None,
-        output_attentions=False,
-        output_hidden_states=True,
-        return_dict=True,
-    )
+        # Forward pass through language model
+        language_model_output = self.language_model(
+            input_ids=None,
+            attention_mask=multimodal_attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=multimodal_embeddings,
+            labels=None,
+            use_cache=None,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
 
-    # 4. 提取动作token的hidden state
-    last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-    actions_hidden_states = last_hidden_states[
-        :,
-        NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-        :,
-    ]  # (B, act_chunk_len, D)
+        # Get last layer hidden states and extract those for action tokens
+        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+        actions_hidden_states = last_hidden_states[
+            :,
+            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            :,
+        ]  # (B, act_chunk_len, D)
 
-    # 5. 多步采样
-    predicted_actions = action_head.predict_action(actions_hidden_states)  # (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
-    predicted_actions = predicted_actions[0] if predicted_actions.shape[0] == 1 else predicted_actions
-    predicted_actions = predicted_actions.float().cpu().detach().numpy()
-    return predicted_actions, actions_hidden_states
+        # Reshape to expected format
+        batch_size = actions_hidden_states.shape[0]
+        actions_hidden_states = actions_hidden_states.reshape(
+            batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
+        )
+
+        # 多步Flow Matching采样
+        x = torch.randn(
+            size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM),
+            device=actions_hidden_states.device,
+            dtype=actions_hidden_states.dtype
+        )
+        
+        num_steps = action_head.num_flow_steps
+        t_vals = torch.linspace(0, 1, num_steps + 1, device=actions_hidden_states.device)
+        dt = 1.0 / num_steps
+        
+        for i in range(num_steps):
+            t_scalar = t_vals[i].expand(batch_size)
+            t_emb = action_head.time_encoder(t_scalar).unsqueeze(1)  # (batch, 1, hidden_dim)
+            v = action_head.forward(actions_hidden_states, t_emb, x)  # 传入当前位置x
+            x = x + v * dt
+                
+        # 转换为numpy并返回
+        predicted_actions = x.float().cpu().detach().numpy()
+        predicted_actions = predicted_actions[0] if predicted_actions.shape[0] == 1 else predicted_actions
+        
+        return predicted_actions
     
+    def _run_ot_flow_matching_prediction(self, *args, **kwargs):
+        """
+        OT Flow Matching uses the same inference procedure as regular flow matching,
+        the difference is only in the training process
+        """
+        return self._run_flow_matching_prediction(*args, **kwargs)
      
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:

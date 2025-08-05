@@ -24,7 +24,7 @@ json_numpy.patch()
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead, FlowMatchingActionHead
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead, FlowMatchingActionHead, OTFlowMatchingActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
@@ -475,8 +475,14 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         AssertionError: If both L1 regression and diffusion are specified
     """
     # assert not (cfg.use_l1_regression and cfg.use_diffusion and cfg.use_vae and cfg.use_flow_matching), "Cannot use L1 regression, diffusion action, VAE and Flowmatching head!"
-    assert sum([cfg.use_l1_regression, cfg.use_diffusion, cfg.use_vae, cfg.use_flow_matching]) <= 1, \
-    "Cannot use more than one of L1 regression, diffusion, VAE, or FlowMatching head!"
+    assert sum([
+        cfg.use_l1_regression, 
+        cfg.use_diffusion, 
+        cfg.use_vae, 
+        getattr(cfg, "use_flow_matching", False), 
+        getattr(cfg, "use_ot_flow_matching", False),
+        getattr(cfg, "use_cot_flow_matching", False)
+    ]) <= 1, "Cannot use more than one action head type!"
 
     # Initialize appropriate action head based on configuration
     if cfg.use_l1_regression:
@@ -493,6 +499,22 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     elif cfg.use_flow_matching:
         action_head = FlowMatchingActionHead(
             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_flow_steps=getattr(cfg, "num_flow_steps", 20)
+        )
+    elif cfg.use_ot_flow_matching:
+        action_head = OTFlowMatchingActionHead(
+            input_dim=llm_dim, 
+            hidden_dim=llm_dim, 
+            action_dim=ACTION_DIM,
+            num_flow_steps=getattr(cfg, "num_flow_steps", 20)
+        )
+    elif cfg.use_cot_flow_matching:
+        action_head = COTFlowMatchingActionHead(
+            input_dim=llm_dim, 
+            hidden_dim=llm_dim, 
+            action_dim=ACTION_DIM,
+            num_flow_steps=getattr(cfg, "num_flow_steps", 20),
+            condition_coordinates=getattr(cfg, "condition_coordinates", None),
+            eps=getattr(cfg, "cot_eps", 0.1)
         )
     else:
         raise ValueError("Either use_l1_regression or use_diffusion must be True")

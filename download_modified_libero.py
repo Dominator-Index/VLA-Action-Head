@@ -2,7 +2,7 @@ from huggingface_hub import snapshot_download
 import os
 
 # 设置本地目标路径
-target_dir = "/home/ouyangzl/openvla-oft/modified_libero_rlds"
+target_dir = "/jumbo/yaoqingyang/ouyangzhuoli/Robotics/Data/modified_libero_rlds"
 
 # 开始下载整个仓库的所有内容
 print(f"📥 正在下载 HuggingFace 数据集到: {target_dir}")

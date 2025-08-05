@@ -139,6 +139,21 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    
+    # 确保不同动作生成方法不能同时使用
+    action_head_types = sum([
+        cfg.use_l1_regression, 
+        cfg.use_vae, 
+        cfg.use_diffusion, 
+        getattr(cfg, "use_flow_matching", False),
+        getattr(cfg, "use_ot_flow_matching", False),
+        getattr(cfg, "use_cot_flow_matching", False)  # 添加此行
+    ])
+    assert action_head_types <= 1, "Cannot use multiple action head types simultaneously!"
+    
+    # 检查Flow Matching步数
+    if cfg.use_flow_matching or cfg.use_ot_flow_matching:
+        assert cfg.num_flow_steps > 0, "num_flow_steps must be positive for Flow Matching!"
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -160,7 +175,7 @@ def initialize_model(cfg: GenerateConfig):
 
     # Load action head if needed
     action_head = None
-    if cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion:
+    if cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion or cfg.use_flow_matching or cfg.use_ot_flow_matching:
         action_head = get_action_head(cfg, model.llm_dim)
 
     # Load noisy action projector if using diffusion
@@ -195,8 +210,20 @@ def check_unnorm_key(cfg: GenerateConfig, model) -> None:
 
 def setup_logging(cfg: GenerateConfig):
     """Set up logging to file and optionally to swanlab."""
-    # Create run ID
-    run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+    # Create run ID with model type
+    model_type = "base"
+    if cfg.use_l1_regression:
+        model_type = "L1"
+    elif cfg.use_vae:
+        model_type = "VAE"
+    elif cfg.use_diffusion:
+        model_type = "Diffusion"
+    elif cfg.use_flow_matching:
+        model_type = "FlowMatching"
+    elif cfg.use_ot_flow_matching:
+        model_type = "OTFlowMatching"
+    
+    run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{model_type}-{DATE_TIME}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
 
@@ -245,7 +272,6 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
     else:
         log_message("Using default initial states", log_file)
         return initial_states, None
-
 
 def prepare_observation(obs, resize_size):
     """Prepare observation for policy input."""
