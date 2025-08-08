@@ -6,7 +6,7 @@ Fine-tunes OpenVLA via LoRA.
 
 import os
 # 设置分布式环境变量
-os.environ["MASTER_ADDR"] = "localhost"
+os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "40320"
 
 import time
@@ -42,7 +42,15 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead, FlowMatchingActionHead, OTFlowMatchingActionHead
+from prismatic.models.action_heads import (
+    DiffusionActionHead, 
+    L1RegressionActionHead, 
+    VAEActionHead, 
+    FlowMatchingActionHead, 
+    OTFlowMatchingActionHead, 
+    COTFlowMatchingActionHead,
+    EndToEndDiffusionActionHead  
+)
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -132,8 +140,6 @@ class FinetuneConfig:
     lora_rank: int = 32                              # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                        # Dropout applied to LoRA weights
     merge_lora_during_training: bool = True          # If True, merges LoRA weights and saves result during training
-                                                     #   Note: Merging can be very slow on some machines. If so, set to
-                                                     #         False and merge final checkpoint offline!
 
     # Logging
     swanlab_project: str = "OpenVLA-oft"        # Name of swanlab project
@@ -361,7 +367,7 @@ def run_forward_pass(
             noisy_dict["diffusion_timestep_embeddings"],
         )
     else:
-        noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
+        noise, noisy_actions, diffusionwo1_timestep_embeddings = None, None, None
     
     # [Only for flow matching] Sample x0, t for training
     if use_flow_matching:
@@ -558,8 +564,15 @@ def run_forward_pass(
         )
 
         # Get detailed L1 losses for logging
-        should_log_l1_loss = use_flow_matching or (use_l1_regression or use_vae) or (use_diffusion and compute_diffusion_l1)
-# 缺少 use_end_to_end_diffusion
+        should_log_l1_loss = any([
+                use_flow_matching,
+                use_ot_flow_matching,
+                use_l1_regression,
+                use_vae,
+                (use_diffusion and compute_diffusion_l1),
+                (use_end_to_end_diffusion and compute_diffusion_l1)
+            ])
+
         if should_log_l1_loss:
             ground_truth_curr_action = ground_truth_actions[:, 0]
             predicted_curr_action = predicted_actions[:, 0]
@@ -577,6 +590,49 @@ def run_forward_pass(
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics
 
+def run_end_to_end_diffusion_sampling(
+    vla,
+    action_head,
+    proprio_projector,
+    batch,
+    batch_size,
+    num_patches,
+    actions_shape,
+    device_id,
+    current_action_mask,
+    next_actions_mask,
+    use_proprio,
+    use_film,
+) -> torch.Tensor:
+    """
+    针对端到端扩散模型的专用采样函数
+    """
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        # VLA前向传播获取隐藏状态
+        output = vla(
+            input_ids=batch["input_ids"].to(device_id),
+            attention_mask=batch["attention_mask"].to(device_id),
+            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+            labels=batch["labels"],
+            output_hidden_states=True,
+            proprio=batch["proprio"] if use_proprio else None,
+            proprio_projector=proprio_projector if use_proprio else None,
+            use_film=use_film,
+        )
+        
+        # 获取隐藏状态
+        last_hidden_states = output.hidden_states[-1]
+        text_hidden_states = last_hidden_states[:, num_patches:-1]
+        actions_hidden_states = (
+            text_hidden_states[current_action_mask | next_actions_mask]
+            .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
+            .to(torch.bfloat16)
+        )
+        
+        # 直接调用模型的predict_action方法
+        predicted_actions = action_head.module.predict_action(actions_hidden_states)
+        
+    return predicted_actions
 
 def run_diffusion_sampling(
     vla,
@@ -877,8 +933,19 @@ def save_training_checkpoint(
             torch.save(
                 noisy_action_projector.state_dict(), checkpoint_dir / f"noisy_action_projector--{checkpoint_name_suffix}"
             )
+        
+        # 统一的 action head 保存逻辑
+        action_head_types = [
+            cfg.use_l1_regression,
+            cfg.use_diffusion,
+            cfg.use_vae,
+            getattr(cfg, "use_flow_matching", False),
+            getattr(cfg, "use_ot_flow_matching", False),
+            getattr(cfg, "use_cot_flow_matching", False),
+            getattr(cfg, "use_end_to_end_diffusion", False)
+        ]
 
-        if (cfg.use_l1_regression or cfg.use_diffusion or cfg.use_vae or cfg.use_flow_matching or cfg.use_ot_flow_matching or cfg.use_end_to_end_diffusion) and action_head is not None:
+        if any(action_head_types) and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
         if cfg.use_film:
@@ -954,22 +1021,25 @@ def run_validation(
         for batch in val_dataloader:
             # Always compute L1 loss for validation, even for diffusion
             _, metrics = run_forward_pass(
-                vla=vla,
-                action_head=action_head,
-                noisy_action_projector=noisy_action_projector,
-                proprio_projector=proprio_projector,
-                batch=batch,
-                action_tokenizer=action_tokenizer,
-                device_id=device_id,
-                use_l1_regression=cfg.use_l1_regression,
-                use_vae=cfg.use_vae,
-                use_diffusion=cfg.use_diffusion,
-                use_proprio=cfg.use_proprio,
-                use_film=cfg.use_film,
-                num_patches=num_patches,
-                compute_diffusion_l1=True,
-                num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,
-            )
+                    vla=vla,
+                    action_head=action_head,
+                    noisy_action_projector=noisy_action_projector,
+                    proprio_projector=proprio_projector,
+                    batch=batch,
+                    action_tokenizer=action_tokenizer,
+                    device_id=device_id,
+                    use_l1_regression=cfg.use_l1_regression,
+                    use_vae=cfg.use_vae,
+                    use_diffusion=cfg.use_diffusion,
+                    use_flow_matching=getattr(cfg, "use_flow_matching", False),
+                    use_ot_flow_matching=getattr(cfg, "use_ot_flow_matching", False),
+                    use_end_to_end_diffusion=getattr(cfg, "use_end_to_end_diffusion", False),  # 添加这一行
+                    use_proprio=cfg.use_proprio,
+                    use_film=cfg.use_film,
+                    num_patches=num_patches,
+                    compute_diffusion_l1=True,
+                    num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,
+                )
 
             # Add the loss value to the metrics
             metrics["loss"] = metrics["loss_value"]
@@ -1149,6 +1219,24 @@ def finetune(cfg: FinetuneConfig) -> None:
             device_id,
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
         )
+    
+    if cfg.use_end_to_end_diffusion:
+        action_head = init_module(
+            EndToEndDiffusionActionHead,
+            "action_head",
+            cfg,
+            device_id,
+            {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": vla.module.llm_dim,
+                "action_dim": ACTION_DIM,
+                "num_diffusion_steps": cfg.num_diffusion_steps,
+                "num_layers": cfg.end_to_end_num_layers,
+                "dropout_rate": cfg.end_to_end_dropout_rate,
+                "attn_implementation": cfg.end_to_end_attn_implementation
+            },
+            to_bf16=True,
+        )
 
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
@@ -1235,7 +1323,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
-    if cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion:
+    if cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion or cfg.use_end_to_end_diffusion:
         trainable_params += [param for param in action_head.parameters() if param.requires_grad]
     if cfg.use_diffusion:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
@@ -1350,25 +1438,25 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics = run_forward_pass(
-                vla=vla,
-                action_head=action_head,
-                noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-                proprio_projector=proprio_projector if cfg.use_proprio else None,
-                batch=batch,
-                action_tokenizer=action_tokenizer,
-                device_id=device_id,
-                use_l1_regression=cfg.use_l1_regression,
-                use_vae=cfg.use_vae,
-                use_diffusion=cfg.use_diffusion,
-                use_flow_matching=cfg.use_flow_matching,
-                use_ot_flow_matching=cfg.use_ot_flow_matching,
-                use_proprio=cfg.use_proprio,
-                use_film=cfg.use_film,
-                num_patches=NUM_PATCHES,
-                compute_diffusion_l1=compute_diffusion_l1,
-                num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,
-                num_flow_steps=cfg.num_flow_steps if cfg.use_flow_matching else None,
-            )
+                            vla=vla,
+                            action_head=action_head,
+                            noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+                            proprio_projector=proprio_projector if cfg.use_proprio else None,
+                            batch=batch,
+                            action_tokenizer=action_tokenizer,
+                            device_id=device_id,
+                            use_l1_regression=cfg.use_l1_regression,
+                            use_vae=cfg.use_vae,
+                            use_diffusion=cfg.use_diffusion,
+                            use_flow_matching=getattr(cfg, "use_flow_matching", False),
+                            use_ot_flow_matching=getattr(cfg, "use_ot_flow_matching", False),
+                            use_end_to_end_diffusion=getattr(cfg, "use_end_to_end_diffusion", False),  # 添加这一行
+                            use_proprio=cfg.use_proprio,
+                            use_film=cfg.use_film,
+                            num_patches=NUM_PATCHES,
+                            compute_diffusion_l1=compute_diffusion_l1,
+                            num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,
+                        )
 
             # Normalize loss to account for gradient accumulation
             normalized_loss = loss / cfg.grad_accumulation_steps
@@ -1418,6 +1506,17 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
             if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+                # 统一的 action_head 判断逻辑
+                action_head_exists = any([
+                    cfg.use_l1_regression,
+                    cfg.use_vae,
+                    cfg.use_diffusion,
+                    getattr(cfg, "use_flow_matching", False),
+                    getattr(cfg, "use_ot_flow_matching", False), 
+                    getattr(cfg, "use_cot_flow_matching", False),
+                    getattr(cfg, "use_end_to_end_diffusion", False)
+                ])
+    
                 save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,
@@ -1426,7 +1525,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     processor=processor,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-                    action_head=action_head if (cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion) else None,
+                    action_head=action_head if action_head_exists else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                 )

@@ -474,42 +474,56 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     Raises:
         AssertionError: If both L1 regression and diffusion are specified
     """
-    # assert not (cfg.use_l1_regression and cfg.use_diffusion and cfg.use_vae and cfg.use_flow_matching), "Cannot use L1 regression, diffusion action, VAE and Flowmatching head!"
-    assert sum([
-        cfg.use_l1_regression, 
-        cfg.use_diffusion, 
-        cfg.use_vae, 
+    # 统一的 action head 类型检查
+    action_head_types = [
+        getattr(cfg, "use_l1_regression", False),
+        getattr(cfg, "use_diffusion", False), 
+        getattr(cfg, "use_vae", False),
         getattr(cfg, "use_flow_matching", False), 
         getattr(cfg, "use_ot_flow_matching", False),
         getattr(cfg, "use_cot_flow_matching", False),
-        getattr(cfg, "se_end_to_end_diffusion", False)
-    ]) <= 1, "Cannot use more than one action head type!"
+        getattr(cfg, "use_end_to_end_diffusion", False)
+    ]
+    
+    assert sum(action_head_types) <= 1, "Cannot use more than one action head type!"
+    assert sum(action_head_types) >= 1, "Must specify exactly one action head type!"
+    
+    # 统一的 action head 初始化逻辑
+    action_head = None
 
     # Initialize appropriate action head based on configuration
     if getattr(cfg, "use_end_to_end_diffusion", False):
-        return EndToEndDiffusionActionHead(
+        action_head = EndToEndDiffusionActionHead(
             input_dim=llm_dim,
             hidden_dim=llm_dim,
             action_dim=ACTION_DIM,
             num_diffusion_steps=getattr(cfg, "num_diffusion_steps", 50),
             num_layers=getattr(cfg, "end_to_end_num_layers", 8),
             dropout_rate=getattr(cfg, "end_to_end_dropout_rate", 0.1),
-            attn_implementation=getattr(cfg, "end_to_end_attn_implementation", False)
+            attn_implementation=getattr(cfg, "end_to_end_attn_implementation", "eager")
         )
-    if getattr(cfg, "use_l1_regression", "False"):
+    elif getattr(cfg, "use_l1_regression", False):
         action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
     elif getattr(cfg, "use_vae", False):
         action_head = VAEActionHead(
-            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, latent_dim=getattr(cfg, "vae_latent_dim", 32)
+            input_dim=llm_dim, 
+            hidden_dim=llm_dim, 
+            action_dim=ACTION_DIM, 
+            latent_dim=getattr(cfg, "vae_latent_dim", 32)
         )
-            
     elif getattr(cfg, "use_diffusion", False):
         action_head = DiffusionActionHead(
-            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps=getattr(cfg, "num_diffusion_steps", 50)
+            input_dim=llm_dim, 
+            hidden_dim=llm_dim, 
+            action_dim=ACTION_DIM, 
+            num_diffusion_steps=getattr(cfg, "num_diffusion_steps", 50)
         )
     elif getattr(cfg, "use_flow_matching", False):
         action_head = FlowMatchingActionHead(
-            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_flow_steps=getattr(cfg, "num_flow_steps", 20)
+            input_dim=llm_dim, 
+            hidden_dim=llm_dim, 
+            action_dim=ACTION_DIM, 
+            num_flow_steps=getattr(cfg, "num_flow_steps", 20)
         )
     elif getattr(cfg, "use_ot_flow_matching", False):
         action_head = OTFlowMatchingActionHead(
@@ -527,9 +541,11 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
             condition_coordinates=getattr(cfg, "condition_coordinates", None),
             eps=getattr(cfg, "cot_eps", 0.1)
         )
-    else:
-        raise ValueError("Either use_l1_regression or use_diffusion must be True")
 
+    if action_head is None:
+        raise ValueError("No valid action head type specified in configuration!")
+
+    # 统一的设备和数据类型设置
     action_head = action_head.to(torch.bfloat16).to(DEVICE)
     action_head.eval()
 
@@ -548,19 +564,11 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
             repo_id=cfg.pretrained_checkpoint, filename=model_path_to_action_head_name[cfg.pretrained_checkpoint]
         )
         state_dict = load_component_state_dict(action_head_path)
+                
         action_head.load_state_dict(state_dict)
     else:
         checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_head")
         state_dict = load_component_state_dict(checkpoint_path)
-        if getattr(cfg, "use_diffusion", False):
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith("model."):
-                    new_key = k.replace("model.", "noise_predictor.mlp_resnet.")
-                    new_state_dict[new_key] = v
-                else:
-                    new_state_dict[k] = v
-            
         action_head.load_state_dict(state_dict)
 
     return action_head
