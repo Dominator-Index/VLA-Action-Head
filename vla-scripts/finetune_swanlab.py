@@ -7,9 +7,13 @@ Fine-tunes OpenVLA via LoRA.
 import os
 # 设置分布式环境变量
 os.environ["MASTER_ADDR"] = "127.0.0.1"
-os.environ["MASTER_PORT"] = "40320"
+os.environ["MASTER_PORT"] = "24310"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import sys
+sys.path.insert(0, "/data/jiangjunmin/ouyangzhuoli/VLA-Action-Head/prismatic/extern/hf")
 import time
+import inspect
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +29,7 @@ from accelerate import PartialState
 from huggingface_hub import HfApi, snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import AdamW
+from torch.optim import Adam
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
@@ -87,24 +91,24 @@ class FinetuneConfig:
     dist_rank: Optional[int] = 0
 
     # fmt: off
-    vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)   openvla/openvla-7b
+    vla_path: str = "/data/jiangjunmin/ouyangzhuoli/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)   openvla/openvla-7b
 
     # Dataset
-    data_root_dir: Path = Path("/jumbo/yaoqingyang/ouyangzhuoli/Robotics/Data/modified_libero_rlds")      # Directory containing RLDS datasets
+    data_root_dir: Path = Path("/data/jiangjunmin/ouyangzhuoli/VLA-Action-Head/modified_libero_rlds")      # Directory containing RLDS datasets
     dataset_name: str = "libero_spatial_no_noops"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
-    run_root_dir: Path = Path("/jumbo/yaoqingyang/ouyangzhuoli/Robotics/VLA-Action-Head/Finetune_logs_checkpoints")               # Path to directory to store logs & checkpoints
+    run_root_dir: Path = Path("/data/jiangjunmin/ouyangzhuoli/VLA-Action-Head/Finetune_logs_checkpoints")               # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
     use_l1_regression: bool = False                   # If True, trains continuous action head with L1 regression objective
-    use_vae: bool = True
+    use_vae: bool = False
     vae_latent_dim: int = 64                         # (When `use_vae==True`) Latent dimension of VAE
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for training
-    use_flow_matching: bool = False
+    use_flow_matching: bool = True
     use_ot_flow_matching: bool = False
     use_cot_flow_matching: bool = False
-    num_flow_matching_steps: int = 20
+    num_flow_matching_steps: int = 50
     condition_coordinates: Optional[List[int]] = None  # Which action dimensions to use as conditions
     cot_eps: float = 0.1  # Epsilon parameter for COT
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
@@ -303,7 +307,7 @@ def init_module(
         module.load_state_dict(state_dict)
 
     if to_bf16:
-        module = module.to(torch.bfloat16)
+        module = module.to(torch.bfloat16)  
     module = module.to(device_id)
 
     return wrap_ddp(module, device_id, find_unused_params)
@@ -371,7 +375,8 @@ def run_forward_pass(
     
     # [Only for flow matching] Sample x0, t for training
     if use_flow_matching:
-        batch_size = batch["inputs"].shape[0]
+        action_head = action_head.to(dtype=torch.bfloat16)
+        batch_size = batch["actions"].shape[0]
         # x1: ground-truth actions (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
         x1 = ground_truth_actions
         # x0: Gaussian noise (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
@@ -515,6 +520,7 @@ def run_forward_pass(
             )
             # 推理/评估时采样动作
             with torch.no_grad():
+                
                 predicted_actions = run_flow_matching_sampling(
                     vla=vla,
                     action_head=action_head,
@@ -749,11 +755,8 @@ def run_flow_matching_sampling(
 
     t_vals = torch.linspace(0, 1, num_steps + 1, device=device_id)
     dt = 1.0 / num_steps
-
-    for i in range(num_steps):
-        t_scalar = t_vals[i].expand(batch_size)
-        t_emb = action_head.module.time_encoder(t_scalar).unsqueeze(1)  # (B, 1, D)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+    
+    with torch.autocast("cuda", dtype=torch.bfloat16):
             output = vla(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
@@ -769,6 +772,11 @@ def run_flow_matching_sampling(
             actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(
                 batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
             ).to(torch.bfloat16)
+
+    for i in range(num_steps):
+        t_scalar = t_vals[i].expand(batch_size).to(dtype=torch.bfloat16)
+        t_emb = action_head.module.time_encoder(t_scalar).unsqueeze(1)  # (B, 1, D)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             # 将当前位置 x 作为输入传递给模型
             v = action_head.module.forward(actions_hidden_states, t_emb, x)  # 正确传递x参数
             x = x + v * dt
@@ -801,13 +809,10 @@ def run_ot_flow_matching_sampling(
     )
     num_steps = action_head.module.num_flow_steps
 
-    t_vals = torch.linspace(0, 1, num_steps + 1, device=device_id)
+    t_vals = torch.linspace(0, 1, num_steps + 1, device=device_id).to(dtype=torch.bfloat16)
     dt = 1.0 / num_steps
-
-    for i in range(num_steps):
-        t_scalar = t_vals[i].expand(batch_size)
-        t_emb = action_head.module.time_encoder(t_scalar).unsqueeze(1)  # (B, 1, D)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+    
+    with torch.autocast("cuda", dtype=torch.bfloat16):
             output = vla(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
@@ -823,6 +828,11 @@ def run_ot_flow_matching_sampling(
             actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(
                 batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
             ).to(torch.bfloat16)
+
+    for i in range(num_steps):
+        t_scalar = t_vals[i].expand(batch_size).to(dtype=torch.bfloat16)
+        t_emb = action_head.module.time_encoder(t_scalar).unsqueeze(1)  # (B, 1, D)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             v = action_head.module.forward(actions_hidden_states, t_emb, x)  # 正确传递x参数
             x = x + v * dt
     return x.reshape(actions_shape)
@@ -1148,6 +1158,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     if model_is_on_hf_hub(cfg.vla_path):
         # Download model directly from Hugging Face Hub
         vla_download_path = snapshot_download(repo_id=cfg.vla_path)
+        print(f"Downloaded OpenVLA model to: {vla_download_path}")
         # Overwrite VLA path
         cfg.vla_path = vla_download_path
     else:
@@ -1174,6 +1185,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device_id)
+    
+    print("Vision backbone class:", type(vla.vision_backbone))
+    print("Vision backbone source file:", inspect.getfile(type(vla.vision_backbone)))
+    print("Has set_num_images_in_input:", hasattr(vla.vision_backbone, 'set_num_images_in_input'))
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -1316,10 +1331,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
     if cfg.use_diffusion:
         NUM_PATCHES += 1
-    if cfg.use_flow_matching:
-        NUM_PATCHES += 1
-    if cfg.use_ot_flow_matching:
-        NUM_PATCHES += 1
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
@@ -1334,7 +1345,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    optimizer = Adam(trainable_params, lr=cfg.learning_rate)
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]

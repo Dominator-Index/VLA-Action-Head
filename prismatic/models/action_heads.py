@@ -324,10 +324,12 @@ class FlowMatchingActionHead(nn.Module):
         return: (batch, NUM_ACTIONS_CHUNK, action_dim)
         """
         batch_size = actions_hidden_states.shape[0]
+    
         # (batch, NUM_ACTIONS_CHUNK, action_dim * input_dim)
         x = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+        
         # t_emb: (batch, 1, hidden_dim) -> broadcast到NUM_ACTIONS_CHUNK
-        t_emb = t_emb.expand(-1, NUM_ACTIONS_CHUNK, -1)
+        t_emb = t_emb.expand(-1, NUM_ACTIONS_CHUNK, -1).to(dtype=torch.bfloat16)
         # 拼接特征、时间编码和当前位置
         x = torch.cat([x, t_emb, x_t], dim=-1)  
         vector_field = self.model(x)  # (batch, NUM_ACTIONS_CHUNK, action_dim)
@@ -340,11 +342,17 @@ class FlowMatchingActionHead(nn.Module):
         t: (batch,) or (batch, 1)                   # 路径采样时间
         actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
         """
-        t = t.view(-1, 1, 1)  # (batch, 1, 1)
+        # 获取模型参数的数据类型
+        model_dtype = next(self.parameters()).dtype
+        x0 = x0.to(dtype=model_dtype)
+        x1 = x1.to(dtype=model_dtype)
+        # 确保输入数据类型与模型一致
+        actions_hidden_states = actions_hidden_states.to(dtype=model_dtype)
+        t = t.view(-1, 1, 1).to(dtype=model_dtype)  # (batch, 1, 1)
         x_t = (1 - t) * x0 + t * x1  # (batch, NUM_ACTIONS_CHUNK, action_dim)
         u_t = x1 - x0  # (batch, NUM_ACTIONS_CHUNK, action_dim)
         # 时间编码
-        t_scalar = t.view(-1)  # (batch,)
+        t_scalar = t.view(-1).to(dtype=torch.bfloat16)  # (batch,)
         t_emb = self.time_encoder(t_scalar)  # (batch, hidden_dim)
         t_emb = t_emb.unsqueeze(1)  # (batch, 1, hidden_dim)
         # 将x_t作为输入传递给模型
@@ -377,16 +385,19 @@ class OTFlowMatchingActionHead(FlowMatchingActionHead):
             t: (batch,) or (batch, 1)                  # Path sampling time
             actions_hidden_states: (batch, NUM_ACTIONS_CHUNK * action_dim, input_dim)
         """
+        model_dtype = next(self.parameters()).dtype
         # Get OT matched pairs
         x0_ot, x1_ot = self.ot_plan_sampler.sample_plan(x0, x1)
+        x0_ot = x0_ot.to(dtype=model_dtype)
+        x1_ot = x1_ot.to(dtype=model_dtype)
         
         # Now proceed with standard flow matching using OT matched pairs
-        t = t.view(-1, 1, 1)  # (batch, 1, 1)
+        t = t.view(-1, 1, 1).to(dtype=model_dtype)  # (batch, 1, 1)
         x_t = (1 - t) * x0_ot + t * x1_ot  # (batch, NUM_ACTIONS_CHUNK, action_dim)
         u_t = x1_ot - x0_ot  # (batch, NUM_ACTIONS_CHUNK, action_dim)
         
         # Time encoding
-        t_scalar = t.view(-1)  # (batch,)
+        t_scalar = t.view(-1).to(dtype=model_dtype)  # (batch,)
         t_emb = self.time_encoder(t_scalar)  # (batch, hidden_dim)
         t_emb = t_emb.unsqueeze(1)  # (batch, 1, hidden_dim)
         
