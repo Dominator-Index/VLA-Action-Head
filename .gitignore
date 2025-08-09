@@ -155,3 +155,4 @@ wandb/
 # Test files
 vla-scripts/*.txt
 modified_libero_rlds/
+Finetune_logs_checkpoints/
