@@ -7,8 +7,8 @@ Fine-tunes OpenVLA via LoRA.
 import os
 # 设置分布式环境变量
 os.environ["MASTER_ADDR"] = "127.0.0.1"
-os.environ["MASTER_PORT"] = "24310"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+os.environ["MASTER_PORT"] = "22310"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import sys
 sys.path.insert(0, "/data/jiangjunmin/ouyangzhuoli/VLA-Action-Head/prismatic/extern/hf")
@@ -91,7 +91,7 @@ class FinetuneConfig:
     dist_rank: Optional[int] = 0
 
     # fmt: off
-    vla_path: str = "/data/jiangjunmin/ouyangzhuoli/VLA-Action-Head/Finetune_logs_checkpoints/openvla-7b+libero_spatial_no_noops+b8+lr-0.0005+lora-r32+dropout-0.0--image_aug--diffusion--10000_chkpt"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)   openvla/openvla-7b
+    vla_path: str = "/data/jiangjunmin/ouyangzhuoli/VLA-Action-Head/Finetune_logs_checkpoints/openvla-7b+libero_spatial_no_noops+b8+lr-0.0005+lora-r32+dropout-0.0--image_aug--diffusion--20000_chkpt"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)   openvla/openvla-7b
 
     # Dataset
     data_root_dir: Path = Path("/data/jiangjunmin/ouyangzhuoli/VLA-Action-Head/modified_libero_rlds")      # Directory containing RLDS datasets
@@ -135,7 +135,7 @@ class FinetuneConfig:
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
     resume: bool = True                             # If True, resumes from checkpoint
-    resume_step: Optional[int] = 10000                # (When `resume==True`) Step number that we are resuming from
+    resume_step: Optional[int] = 20000                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
