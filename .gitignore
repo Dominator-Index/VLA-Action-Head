@@ -156,6 +156,7 @@ wandb/
 vla-scripts/*.txt
 modified_libero_rlds/
 Finetune_logs_checkpoints/
+*.txt
 
 # Chat History
 openai/*.md
