@@ -159,3 +159,6 @@ Finetune_logs_checkpoints/
 
 # Chat History
 openai/*.md
+
+# Evaluation
+experiments/logs
