@@ -166,3 +166,6 @@ experiments/logs
 
 # libEGL
 libEGL
+
+# Dataset
+modified_libero_rlds_pointer
