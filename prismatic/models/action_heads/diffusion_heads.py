@@ -116,6 +116,45 @@ class DiffusionActionHead(BaseActionHead):
         noise_pred = self.noise_predictor(rearranged_actions_hidden_states)
         return noise_pred
 
+    @torch.no_grad()
+    def predict_action(self, actions_hidden_states):
+        """
+        Predict actions using reverse diffusion sampling.
+        Note: This is an approximation since DiffusionActionHead requires VLA forward passes for accurate multi-step sampling.
+        Here, we use fixed actions_hidden_states for all steps, which is not fully accurate but follows the structure of run_diffusion_sampling.
+        """
+        batch_size = actions_hidden_states.shape[0]
+        device = actions_hidden_states.device
+        
+        # Sample random noisy action, used as the starting point for reverse diffusion
+        noise = torch.randn(
+            size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM),
+            device=device,
+            dtype=actions_hidden_states.dtype,
+        )
+        
+        # Set diffusion timestep values
+        self.noise_scheduler.set_timesteps(self.num_diffusion_steps)
+        
+        # Reverse diffusion: Iteratively denoise to generate action, conditioned on observation
+        curr_noisy_actions = noise
+        for t in self.noise_scheduler.timesteps:
+            # Get diffusion model's noise prediction (using fixed actions_hidden_states)
+            timesteps = torch.Tensor([t]).repeat(batch_size).to(device)
+            diffusion_timestep_embeddings = (
+                self.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
+            )
+            diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)
+            
+            # Predict noise (note: in full sampling, actions_hidden_states would be updated via VLA forward pass)
+            noise_pred = self.predict_noise(actions_hidden_states)
+            noise_pred = noise_pred.reshape(curr_noisy_actions.shape)
+            
+            # Compute the action at the previous diffusion timestep: x_t -> x_{t-1}
+            curr_noisy_actions = self.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
+        
+        return curr_noisy_actions
+
     def compute_loss(self, actions_hidden_states, ground_truth_actions):
         noisy_dict = self.sample_noisy_actions(ground_truth_actions)
         noise = noisy_dict["noise"]

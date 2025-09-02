@@ -59,19 +59,13 @@ class ShortcutActionHead(nn.Module):
         self._initialize_parameters()
     
     def _initialize_parameters(self):
-        """Initialize parameters for the convex flow model."""
-        # Initialize ICNN parameters
+        """Initialize parameters for the shortcut model."""
+        # Initialize parameters for velocity_net and other linear layers
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        
-        # Initialize flow parameters with small values for stability
-        if hasattr(self.convex_flow, 'w0'):
-            nn.init.constant_(self.convex_flow.w0, -1.0)  # softplus(-1) ≈ 0.31
-        if hasattr(self.convex_flow, 'w1'):
-            nn.init.constant_(self.convex_flow.w1, 0.0)  # 使用固定值，因为bias_w1已经在flow初始化时设置
     
     def forward(self, actions_hidden_states, t, dt, x_t, apply_cfg_dropout=True):
         """
