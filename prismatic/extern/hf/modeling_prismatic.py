@@ -931,6 +931,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         use_vae = action_head is not None and hasattr(action_head, "get_vae_loss")
         use_flow_matching = action_head is not None and hasattr(action_head, "compute_flow_matching_loss") and not hasattr(action_head, "compute_ot_plan")
         use_ot_flow_matching = action_head is not None and hasattr(action_head, "compute_ot_plan")
+        use_mean_flow = action_head is not None and hasattr(action_head, "compute_meanflow_loss")  # 新增
+        use_convex_flow = action_head is not None and hasattr(action_head, "compute_convex_flow_loss")  # 新增
+        use_shortcut_model = action_head is not None and hasattr(action_head, "compute_shortcut_loss")  # 新增
+        use_normalizing_flow = action_head is not None and hasattr(action_head, "compute_normalizing_flow_loss")  # 新增
 
         # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
         NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
@@ -938,6 +942,54 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             NUM_PATCHES += 1
         if use_diffusion:
             NUM_PATCHES += 1
+            
+        if use_mean_flow:  # 新增
+            normalized_actions, actions_hidden_states = self._run_mean_flow_prediction(
+                input_embeddings,
+                all_actions_mask,
+                projected_patch_embeddings,
+                attention_mask,
+                labels,
+                NUM_PATCHES,
+                NUM_PROMPT_TOKENS,
+                action_head,
+            )
+
+        if use_convex_flow:  # 新增
+            normalized_actions, actions_hidden_states = self._run_convex_flow_prediction(
+                input_embeddings,
+                all_actions_mask,
+                projected_patch_embeddings,
+                attention_mask,
+                labels,
+                NUM_PATCHES,
+                NUM_PROMPT_TOKENS,
+                action_head,
+            )
+
+        if use_shortcut_model:  # 新增
+            normalized_actions, actions_hidden_states = self._run_shortcut_model_prediction(
+                input_embeddings,
+                all_actions_mask,
+                projected_patch_embeddings,
+                attention_mask,
+                labels,
+                NUM_PATCHES,
+                NUM_PROMPT_TOKENS,
+                action_head,
+            )
+
+        if use_normalizing_flow:  # 新增
+            normalized_actions, actions_hidden_states = self._run_normalizing_flow_prediction(
+                input_embeddings,
+                all_actions_mask,
+                projected_patch_embeddings,
+                attention_mask,
+                labels,
+                NUM_PATCHES,
+                NUM_PROMPT_TOKENS,
+                action_head,
+            )
 
         if use_diffusion:
             # Sample random noise with shape equal to output action, used as the starting state for reverse diffusion
@@ -1008,6 +1060,258 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
 
         return actions, actions_hidden_states
+    
+    def _run_mean_flow_prediction(
+        self,
+        input_embeddings,
+        all_actions_mask,
+        projected_patch_embeddings,
+        attention_mask,
+        labels,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+        action_head,
+    ):
+        """
+        Run MeanFlow-based action prediction using single-step sampling.
+        
+        Args:
+            input_embeddings: Embeddings from the language model embedding layer
+            all_actions_mask: Boolean mask for action tokens
+            projected_patch_embeddings: Visual features after projection
+            attention_mask: Attention mask
+            labels: Labels for action mask computation
+            NUM_PATCHES: Number of visual patches
+            NUM_PROMPT_TOKENS: Number of prompt tokens
+            action_head: MeanFlow action head
+        
+        Returns:
+            mean_flow_actions: Predicted actions
+        """
+        # Zero out action token embeddings
+        all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+        input_embeddings = input_embeddings * ~all_actions_mask
+
+        # Build multimodal embeddings & attention mask
+        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+            input_embeddings, projected_patch_embeddings, attention_mask
+        )
+        
+        # Forward pass through language model
+        language_model_output = self.language_model(
+            input_ids=None,
+            attention_mask=multimodal_attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=multimodal_embeddings,
+            labels=None,
+            use_cache=None,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        
+        # Extract action hidden states
+        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+        actions_hidden_states = last_hidden_states[
+            :,
+            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            :,
+        ]  # (B, act_chunk_len, D)
+        
+        # Use MeanFlow's predict_action method for single-step sampling
+        mean_flow_actions = action_head.predict_action(actions_hidden_states)
+        
+        return mean_flow_actions, actions_hidden_states
+
+    def _run_convex_flow_prediction(
+        self,
+        input_embeddings,
+        all_actions_mask,
+        projected_patch_embeddings,
+        attention_mask,
+        labels,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+        action_head,
+    ):
+        """
+        Run ConvexFlow-based action prediction using convex optimization-based flow.
+        
+        Args:
+            input_embeddings: Embeddings from the language model embedding layer
+            all_actions_mask: Boolean mask for action tokens
+            projected_patch_embeddings: Visual features after projection
+            attention_mask: Attention mask
+            labels: Labels for action mask computation
+            NUM_PATCHES: Number of visual patches
+            NUM_PROMPT_TOKENS: Number of prompt tokens
+            action_head: ConvexFlow action head
+        
+        Returns:
+            convex_flow_actions: Predicted actions
+        """
+        # Zero out action token embeddings
+        all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+        input_embeddings = input_embeddings * ~all_actions_mask
+
+        # Build multimodal embeddings & attention mask
+        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+            input_embeddings, projected_patch_embeddings, attention_mask
+        )
+        
+        # Forward pass through language model
+        language_model_output = self.language_model(
+            input_ids=None,
+            attention_mask=multimodal_attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=multimodal_embeddings,
+            labels=None,
+            use_cache=None,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        
+        # Extract action hidden states
+        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+        actions_hidden_states = last_hidden_states[
+            :,
+            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            :,
+        ]  # (B, act_chunk_len, D)
+        
+        # Use ConvexFlow's predict_action method
+        convex_flow_actions = action_head.predict_action(actions_hidden_states)
+        
+        return convex_flow_actions, actions_hidden_states
+
+    def _run_shortcut_model_prediction(
+        self,
+        input_embeddings,
+        all_actions_mask,
+        projected_patch_embeddings,
+        attention_mask,
+        labels,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+        action_head,
+    ):
+        """
+        Run ShortcutModel-based action prediction using direct shortcut connections.
+        
+        Args:
+            input_embeddings: Embeddings from the language model embedding layer
+            all_actions_mask: Boolean mask for action tokens
+            projected_patch_embeddings: Visual features after projection
+            attention_mask: Attention mask
+            labels: Labels for action mask computation
+            NUM_PATCHES: Number of visual patches
+            NUM_PROMPT_TOKENS: Number of prompt tokens
+            action_head: ShortcutModel action head
+        
+        Returns:
+            shortcut_actions: Predicted actions
+        """
+        # Zero out action token embeddings
+        all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+        input_embeddings = input_embeddings * ~all_actions_mask
+
+        # Build multimodal embeddings & attention mask
+        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+            input_embeddings, projected_patch_embeddings, attention_mask
+        )
+        
+        # Forward pass through language model
+        language_model_output = self.language_model(
+            input_ids=None,
+            attention_mask=multimodal_attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=multimodal_embeddings,
+            labels=None,
+            use_cache=None,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        
+        # Extract action hidden states
+        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+        actions_hidden_states = last_hidden_states[
+            :,
+            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            :,
+        ]  # (B, act_chunk_len, D)
+        
+        # Use ShortcutModel's predict_action method
+        shortcut_actions = action_head.predict_action(actions_hidden_states)
+        
+        return shortcut_actions, actions_hidden_states
+
+    def _run_normalizing_flow_prediction(
+        self,
+        input_embeddings,
+        all_actions_mask,
+        projected_patch_embeddings,
+        attention_mask,
+        labels,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+        action_head,
+    ):
+        """
+        Run NormalizingFlow-based action prediction using normalizing flows.
+        
+        Args:
+            input_embeddings: Embeddings from the language model embedding layer
+            all_actions_mask: Boolean mask for action tokens
+            projected_patch_embeddings: Visual features after projection
+            attention_mask: Attention mask
+            labels: Labels for action mask computation
+            NUM_PATCHES: Number of visual patches
+            NUM_PROMPT_TOKENS: Number of prompt tokens
+            action_head: NormalizingFlow action head
+        
+        Returns:
+            normalizing_flow_actions: Predicted actions
+        """
+        # Zero out action token embeddings
+        all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+        input_embeddings = input_embeddings * ~all_actions_mask
+
+        # Build multimodal embeddings & attention mask
+        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+            input_embeddings, projected_patch_embeddings, attention_mask
+        )
+        
+        # Forward pass through language model
+        language_model_output = self.language_model(
+            input_ids=None,
+            attention_mask=multimodal_attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=multimodal_embeddings,
+            labels=None,
+            use_cache=None,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        
+        # Extract action hidden states
+        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+        actions_hidden_states = last_hidden_states[
+            :,
+            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            :,
+        ]  # (B, act_chunk_len, D)
+        
+        # Use NormalizingFlow's predict_action method
+        normalizing_flow_actions = action_head.predict_action(actions_hidden_states)
+        
+        return normalizing_flow_actions, actions_hidden_states
     
     def _run_vae_prediction(
         self,

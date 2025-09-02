@@ -169,3 +169,6 @@ libEGL
 
 # Dataset
 modified_libero_rlds_pointer
+
+# hyperbolicity
+/home/ouyangzl/openvla-oft/Hyperbolicity/hyperbolicity_results_chunk_level

@@ -7,8 +7,8 @@ Fine-tunes OpenVLA via LoRA.
 import os
 # 设置分布式环境变量
 os.environ["MASTER_ADDR"] = "127.0.0.1"
-os.environ["MASTER_PORT"] = "12895"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["MASTER_PORT"] = "12890"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import sys
 sys.path.append("/home/ouyangzl/openvla-oft/")
@@ -119,11 +119,11 @@ class FinetuneConfig:
     use_flow_matching: bool = False                   # If True, trains continuous action head with flow matching objective
     use_ot_flow_matching: bool = False
     use_cot_flow_matching: bool = False
-    use_mean_flow: bool = True 
-    use_convex_flow: bool = False  # 新增：使用凸流动作头（normalizing flow）
+    use_mean_flow: bool = False 
+    use_convex_flow: bool = True  # 新增：使用凸流动作头（normalizing flow）
     use_shortcut_model: bool = False  # 新增：使用快捷模型动作头
     num_flow_matching_steps: int = 50
-    condition_coordinates: Optional[List[int]] = None  # Which action dimensions to use as conditions
+    condition_coordinates: Optional[List[int]] = None  # Which action dimensions to use conditions
     cot_eps: float = 0.1  # Epsilon parameter for COT
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
@@ -401,7 +401,7 @@ def run_forward_pass(
             noisy_dict["diffusion_timestep_embeddings"],
         )
     else:
-        noise, noisy_actions, diffusionwo1_timestep_embeddings = None, None, None
+        noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
     
     # [Only for flow matching] Sample x0, t for training
     if use_flow_matching or use_ot_flow_matching or use_mean_flow or use_convex_flow or use_shortcut_model or use_normalizing_flow:  # 修复条件
@@ -1453,8 +1453,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             init_kwargs["rank"] = cfg.dist_rank
         dist.init_process_group(**init_kwargs)
 
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")  # 或 "gloo"，根据你的环境
+    # if not dist.is_initialized():
+    #     dist.init_process_group(backend="nccl")  # 或 "gloo"，根据你的环境
 
     if dist.is_available() and dist.is_initialized():
         print(f"[Distributed] rank: {dist.get_rank()}, world_size: {dist.get_world_size()}")
@@ -1590,15 +1590,15 @@ def finetune(cfg: FinetuneConfig) -> None:
             param.requires_grad = False
         print("VLA backbone frozen. Only action head will be trained.")
 
-    # Wrap VLA with DDP
-    if cfg.only_action_head:
-        # 当只训练action head时，不需要DDP，因为VLA被冻结了
-        print("Skipping DDP for VLA (backbone frozen)")
-        # 直接使用原始模型，不包装DDP
-    else:
+    # Wrap VLA with DDP (always wrap for multi-GPU support, even if frozen)
+    # 检查VLA是否有可训练参数，如果没有则不包装
+    has_trainable_params = any(p.requires_grad for p in vla.parameters())
+    if has_trainable_params:
         vla = wrap_ddp(vla, device_id, find_unused=True)
+    else:
+        print("VLA has no trainable parameters, skipping DDP wrapping.")
     
-    llm_dim = vla.module.llm_dim if not cfg.only_action_head else vla.llm_dim
+    llm_dim = vla.module.llm_dim if has_trainable_params else vla.llm_dim
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
@@ -1761,10 +1761,10 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Get number of vision patches
     # 修复后
-    if cfg.only_action_head:
-        NUM_PATCHES = vla.vision_backbone.get_num_patches() * vla.vision_backbone.get_num_images_in_input()
-    else:
+    if has_trainable_params:
         NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    else:
+        NUM_PATCHES = vla.vision_backbone.get_num_patches() * vla.vision_backbone.get_num_images_in_input()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
@@ -1786,11 +1786,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
-    print(f"VLA trainable params: {sum(p.numel() for p in vla.parameters() if p.requires_grad)}")
-    print(f"Action head trainable params: {sum(p.numel() for p in action_head.parameters() if p.requires_grad)}")
+    print(f"VLA trainable params: {sum(p.numel() for p in vla.parameters() if param.requires_grad)}")
+    print(f"Action head trainable params: {sum(p.numel() for p in action_head.parameters() if param.requires_grad)}")
     # 在第1341行后添加验证
     if cfg.only_action_head:
-        vla_trainable = sum(p.numel() for p in vla.parameters() if p.requires_grad)
+        vla_trainable = sum(p.numel() for p in vla.parameters() if param.requires_grad)
         assert vla_trainable == 0, f"VLA should have 0 trainable params but has {vla_trainable}"
         print("✅ Verified: VLA backbone is completely frozen")
     optimizer = Adam(trainable_params, lr=cfg.learning_rate)
@@ -1819,10 +1819,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
     use_wrist_image = cfg.num_images_in_input > 1
 
-    if cfg.only_action_head:
-        image_sizes = vla.config.image_sizes
-    else:
+    if has_trainable_params:
         image_sizes = vla.module.config.image_sizes
+    else:
+        image_sizes = vla.config.image_sizes
     # Create training and optional validation datasets
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
@@ -1846,10 +1846,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg.dataset_name,
             batch_transform,
             resize_resolution=tuple(image_sizes),
-            shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
-            image_aug=cfg.image_aug,
-            train=False,
-        )
+        shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
+        image_aug=cfg.image_aug,
+        train=False,
+    )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:
@@ -2007,8 +2007,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 # 统一的 action_head 判断逻辑
                 action_head_exists = any([
                     cfg.use_l1_regression,
-                    cfg.use_vae,
                     cfg.use_diffusion,
+                    cfg.use_vae,
                     getattr(cfg, "use_flow_matching", False),
                     getattr(cfg, "use_ot_flow_matching", False), 
                     getattr(cfg, "use_cot_flow_matching", False),

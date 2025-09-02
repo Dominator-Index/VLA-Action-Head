@@ -4,11 +4,11 @@ run_libero_eval.py
 Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 """
 
-
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # 指定使用GPU编号为3的GPU
+import sys
 import json
 import logging
-import os
-import sys
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -87,15 +87,23 @@ class GenerateConfig:
     # Model-specific parameters
     #################################################################################################################
     model_family: str = "openvla"                    # Model family
-    pretrained_checkpoint: Union[str, Path] = "moojink/openvla-7b-oft-finetuned-libero-spatial"     # Pretrained checkpoint path
+    # TODO
+    pretrained_checkpoint: Union[str, Path] = "/home/ouyangzl/openvla-oft/Finetune_logs_checkpoints/openvla-7b+libero_spatial_no_noops+b8+lr-0.0005+lora-r32+dropout-0.0--image_aug--VAE--80000_chkpt"    # "moojink/openvla-7b-oft-finetuned-libero-spatial"     # Pretrained checkpoint path
 
-    use_l1_regression: bool = True                   # If True, uses continuous action head with L1 regression objective
-    use_vae: bool = False                            # If True, uses VAE action head
-    vae_latent_dim: int = 64                         # 可选，VAE 潜在空间维度
+    # TODO
+    use_l1_regression: bool = False                   # If True, uses continuous action head with L1 regression objective
+    use_vae: bool = True                            # If True, uses VAE action head
+    vae_latent_dim: int = 32                         # 可选，VAE 潜在空间维度
     use_diffusion: bool = False                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for inference
     use_flow_matching: bool = False
-    num_flow_steps: int = 20
+    num_flow_steps: int = 50
+    use_ot_flow_matching: bool = False
+    use_end_to_end_diffusion: bool = False
+    use_mean_flow: bool = False  # 新增
+    use_convex_flow: bool = False  # 新增：使用凸流动作头
+    use_shortcut_model: bool = False  # 新增：使用快捷模型动作头
+    use_normalizing_flow: bool = False  # 新增：使用 normalizing flow 动作头
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
@@ -111,7 +119,7 @@ class GenerateConfig:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
+    task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite TODO
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
@@ -123,7 +131,7 @@ class GenerateConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
 
-    use_swanlab: bool = False                          # Whether to also log results in Weights & Biases
+    use_swanlab: bool = True                          # Whether to also log results in Weights & Biases
     swanlab_project: str = "OpenVLA-eval"        # Name of swanlab project
 
     seed: int = 7                                    # Random Seed (for reproducibility)
@@ -147,14 +155,13 @@ def validate_config(cfg: GenerateConfig) -> None:
         cfg.use_diffusion, 
         getattr(cfg, "use_flow_matching", False),
         getattr(cfg, "use_ot_flow_matching", False),
-        getattr(cfg, "use_cot_flow_matching", False), # 添加此行
+        getattr(cfg, "use_mean_flow", False),  # 新增
+        getattr(cfg, "use_convex_flow", False),  # 新增
+        getattr(cfg, "use_shortcut_model", False),  # 新增
+        getattr(cfg, "use_normalizing_flow", False),  # 新增
         getattr(cfg, "use_end_to_end_diffusion", False) 
     ])
     assert action_head_types <= 1, "Cannot use multiple action head types simultaneously!"
-    
-    # 检查Flow Matching步数
-    if cfg.use_flow_matching or cfg.use_ot_flow_matching:
-        assert cfg.num_flow_steps > 0, "num_flow_steps must be positive for Flow Matching!"
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -175,9 +182,21 @@ def initialize_model(cfg: GenerateConfig):
         )
 
     # Load action head if needed
+    action_needed = any([
+        cfg.use_l1_regression,
+        cfg.use_vae,
+        cfg.use_diffusion,
+        cfg.use_flow_matching,
+        cfg.use_ot_flow_matching,
+        cfg.use_mean_flow,  # 新增
+        cfg.use_convex_flow,  # 新增
+        cfg.use_shortcut_model,  # 新增
+        cfg.use_normalizing_flow,  # 新增
+        cfg.use_end_to_end_diffusion
+    ])
+    
     action_head = None
-    if cfg.use_l1_regression or cfg.use_vae or cfg.use_diffusion or cfg.use_flow_matching or cfg.use_ot_flow_matching or cfg.use_end_to_end_diffusion:
-        action_head = get_action_head(cfg, model.llm_dim)
+    action_head = get_action_head(cfg, model.llm_dim) if action_needed else None
 
     # Load noisy action projector if using diffusion
     noisy_action_projector = None
@@ -225,6 +244,14 @@ def setup_logging(cfg: GenerateConfig):
         model_type = "FlowMatching"
     elif cfg.use_ot_flow_matching:
         model_type = "OTFlowMatching"
+    elif cfg.use_mean_flow:  # 新增
+        model_type = "MeanFlow"
+    elif cfg.use_convex_flow:  # 新增
+        model_type = "ConvexFlow"
+    elif cfg.use_shortcut_model:  # 新增
+        model_type = "ShortcutModel"
+    elif cfg.use_normalizing_flow:  # 新增
+        model_type = "NormalizingFlow"
         
     
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{model_type}-{DATE_TIME}"

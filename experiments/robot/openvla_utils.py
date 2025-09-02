@@ -24,7 +24,19 @@ json_numpy.patch()
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VAEActionHead, FlowMatchingActionHead, OTFlowMatchingActionHead, OTFlowMatchingActionHead, COTFlowMatchingActionHead, EndToEndDiffusionActionHead
+from prismatic.models.action_heads import (
+    DiffusionActionHead, 
+    L1RegressionActionHead, 
+    VAEActionHead, 
+    FlowMatchingActionHead, 
+    OTFlowMatchingActionHead, 
+    COTFlowMatchingActionHead, 
+    EndToEndDiffusionActionHead,
+    MeanFlowActionHead,  # 新增
+    ConvexFlowActionHead,  # 新增
+    ShortcutActionHead,  # 新增
+    NormalizingFlowActionHead,  # 新增
+)
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
@@ -482,7 +494,10 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         getattr(cfg, "use_flow_matching", False), 
         getattr(cfg, "use_ot_flow_matching", False),
         getattr(cfg, "use_cot_flow_matching", False),
-        getattr(cfg, "use_end_to_end_diffusion", False)
+        getattr(cfg, "use_mean_flow", False),        getattr(cfg, "use_end_to_end_diffusion", False),
+        getattr(cfg, "use_convex_flow", False),  # 新增
+        getattr(cfg, "use_shortcut_model", False),  # 新增
+        getattr(cfg, "use_normalizing_flow", False),  # 新增
     ]
     
     assert sum(action_head_types) <= 1, "Cannot use more than one action head type!"
@@ -492,7 +507,34 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     action_head = None
 
     # Initialize appropriate action head based on configuration
-    if getattr(cfg, "use_end_to_end_diffusion", False):
+    if getattr(cfg, "use_mean_flow", False):  # 新增
+        action_head = MeanFlowActionHead(
+            input_dim=llm_dim, 
+            hidden_dim=llm_dim, 
+            action_dim=ACTION_DIM, 
+            num_flow_steps=getattr(cfg, "num_flow_steps", 20)
+        )
+    elif getattr(cfg, "use_convex_flow", False):  # 新增
+        action_head = ConvexFlowActionHead(
+            input_dim=llm_dim,
+            hidden_dim=llm_dim,
+            action_dim=ACTION_DIM,
+            num_flow_steps=getattr(cfg, "num_flow_steps", 20),
+        )
+    elif getattr(cfg, "use_shortcut_model", False):  # 新增
+        action_head = ShortcutActionHead(
+            input_dim=llm_dim,
+            hidden_dim=llm_dim,
+            action_dim=ACTION_DIM,
+        )
+    elif getattr(cfg, "use_normalizing_flow", False):  # 新增
+        action_head = NormalizingFlowActionHead(
+            input_dim=llm_dim,
+            hidden_dim=llm_dim,
+            action_dim=ACTION_DIM,
+            num_flow_steps=getattr(cfg, "num_flow_steps", 20),
+        )
+    elif getattr(cfg, "use_end_to_end_diffusion", False):
         action_head = EndToEndDiffusionActionHead(
             input_dim=llm_dim,
             hidden_dim=llm_dim,
