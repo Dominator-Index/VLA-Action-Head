@@ -120,7 +120,7 @@ class FinetuneConfig:
     use_ot_flow_matching: bool = False
     use_cot_flow_matching: bool = False
     use_mean_flow: bool = False 
-    use_convex_flow: bool = True  # 新增：使用凸流动作头（normalizing flow）
+    use_convex_flow: bool = False  # 新增：使用凸流动作头（normalizing flow）
     use_shortcut_model: bool = False  # 新增：使用快捷模型动作头
     num_flow_matching_steps: int = 50
     condition_coordinates: Optional[List[int]] = None  # Which action dimensions to use conditions
@@ -1037,9 +1037,9 @@ def run_diffusion_sampling(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
                 pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                labels=batch["labels"],
+                labels=batch["labels"].to(device_id),
                 output_hidden_states=True,
-                proprio=batch["proprio"] if use_proprio else None,
+                proprio=batch["proprio"].to(device_id) if use_proprio else None,
                 proprio_projector=proprio_projector if use_proprio else None,
                 noisy_actions=curr_noisy_actions,
                 noisy_action_projector=noisy_action_projector,
@@ -1096,9 +1096,9 @@ def run_flow_matching_sampling(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
                 pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                labels=batch["labels"],
+                labels=batch["labels"].to(device_id),
                 output_hidden_states=True,
-                proprio=batch["proprio"] if use_proprio else None,
+                proprio=batch["proprio"].to(device_id) if use_proprio else None,
                 proprio_projector=proprio_projector if use_proprio else None,
                 use_film=use_film,
             )
